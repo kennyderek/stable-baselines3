@@ -7,15 +7,17 @@ import torch as th
 
 from stable_baselines3.common import logger
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.buffers import TrajRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
+from abc import ABC, abstractmethod
 
-class OnPolicyAlgorithm(BaseAlgorithm):
+
+class BaseOnPolicyAlgorithm(BaseAlgorithm):
     """
     The base for On-Policy algorithms (ex: A2C/PPO).
 
@@ -71,7 +73,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         _init_setup_model: bool = True,
     ):
 
-        super(OnPolicyAlgorithm, self).__init__(
+        super(BaseOnPolicyAlgorithm, self).__init__(
             policy=policy,
             env=env,
             policy_base=ActorCriticPolicy,
@@ -102,24 +104,27 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        self.rollout_buffer = RolloutBuffer(
-            self.n_steps,
+        self.rollout_buffer = TrajRolloutBuffer(
+            # self.n_steps,
             self.observation_space,
             self.action_space,
             self.device,
-            gamma=self.gamma,
             gae_lambda=self.gae_lambda,
-            n_envs=self.n_envs,
+            gamma=self.gamma,
+            num_trajectories=20
+            # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
             self.observation_space,
             self.action_space,
             self.lr_schedule,
             use_sde=self.use_sde,
+            device=self.device,
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
 
+    @abstractmethod
     def collect_rollouts(
         self, env: VecEnv, callback: BaseCallback, rollout_buffer: RolloutBuffer, n_rollout_steps: int
     ) -> bool:
@@ -134,56 +139,6 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         :return: (bool) True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
-        assert self._last_obs is not None, "No previous observation was provided"
-        n_steps = 0
-        rollout_buffer.reset()
-        # Sample new weights for the state dependent exploration
-        if self.use_sde:
-            self.policy.reset_noise(env.num_envs)
-
-        callback.on_rollout_start()
-
-        while n_steps < n_rollout_steps:
-            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
-                # Sample a new noise matrix
-                self.policy.reset_noise(env.num_envs)
-
-            with th.no_grad():
-                # Convert to pytorch tensor
-                obs_tensor = th.as_tensor(self._last_obs).to(self.device)
-                actions, values, log_probs = self.policy.forward(obs_tensor)
-            actions = actions.cpu().numpy()
-
-            # Rescale and perform action
-            clipped_actions = actions
-            # Clip the actions to avoid out of bound error
-            if isinstance(self.action_space, gym.spaces.Box):
-                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
-
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
-
-            self.num_timesteps += env.num_envs
-
-            # Give access to local variables
-            callback.update_locals(locals())
-            if callback.on_step() is False:
-                return False
-
-            self._update_info_buffer(infos)
-            n_steps += 1
-
-            if isinstance(self.action_space, gym.spaces.Discrete):
-                # Reshape in case of discrete action
-                actions = actions.reshape(-1, 1)
-            rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)
-            self._last_obs = new_obs
-            self._last_dones = dones
-
-        rollout_buffer.compute_returns_and_advantage(values, dones=dones)
-
-        callback.on_rollout_end()
-
-        return True
 
     def train(self) -> None:
         """
@@ -247,3 +202,240 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []
+
+class OnPolicyAlgorithm(BaseOnPolicyAlgorithm):
+    """
+    The base for On-Policy algorithms (ex: A2C/PPO).
+
+    :param policy: (ActorCriticPolicy or str) The policy model to use (MlpPolicy, CnnPolicy, ...)
+    :param env: (Gym environment or str) The environment to learn from (if registered in Gym, can be str)
+    :param learning_rate: (float or callable) The learning rate, it can be a function
+        of the current progress remaining (from 1 to 0)
+    :param n_steps: (int) The number of steps to run for each environment per update
+        (i.e. batch size is n_steps * n_env where n_env is number of environment copies running in parallel)
+    :param gamma: (float) Discount factor
+    :param gae_lambda: (float) Factor for trade-off of bias vs variance for Generalized Advantage Estimator.
+        Equivalent to classic advantage when set to 1.
+    :param ent_coef: (float) Entropy coefficient for the loss calculation
+    :param vf_coef: (float) Value function coefficient for the loss calculation
+    :param max_grad_norm: (float) The maximum value for the gradient clipping
+    :param use_sde: (bool) Whether to use generalized State Dependent Exploration (gSDE)
+        instead of action noise exploration (default: False)
+    :param sde_sample_freq: (int) Sample a new noise matrix every n steps when using gSDE
+        Default: -1 (only sample at the beginning of the rollout)
+    :param tensorboard_log: (str) the log location for tensorboard (if None, no logging)
+    :param create_eval_env: (bool) Whether to create a second environment that will be
+        used for evaluating the agent periodically. (Only available when passing string for the environment)
+    :param monitor_wrapper: When creating an environment, whether to wrap it
+        or not in a Monitor wrapper.
+    :param policy_kwargs: (dict) additional arguments to be passed to the policy on creation
+    :param verbose: (int) the verbosity level: 0 no output, 1 info, 2 debug
+    :param seed: (int) Seed for the pseudo random generators
+    :param device: (str or th.device) Device (cpu, cuda, ...) on which the code should be run.
+        Setting it to auto, the code will be run on the GPU if possible.
+    :param _init_setup_model: (bool) Whether or not to build the network at the creation of the instance
+    """
+
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):
+        print(kwargs)
+        super(OnPolicyAlgorithm, self).__init__(*args, **kwargs)
+
+    def collect_rollouts(
+        self, env: VecEnv, callback: BaseCallback, rollout_buffer: RolloutBuffer, n_rollout_steps: int
+    ) -> bool:
+        """
+        Collect rollouts using the current policy and fill a `RolloutBuffer`.
+
+        :param env: (VecEnv) The training environment
+        :param callback: (BaseCallback) Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: (RolloutBuffer) Buffer to fill with rollouts
+        :param n_steps: (int) Number of experiences to collect per environment
+        :return: (bool) True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        n_steps = 0
+        rollout_buffer.reset()
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor
+                obs_tensor = th.as_tensor(self._last_obs).to(self.device)
+                actions, values, log_probs = self.policy.forward(obs_tensor)
+            actions = actions.cpu().numpy()
+
+            # Rescale and perform action
+            clipped_actions = actions
+            # Clip the actions to avoid out of bound error
+            if isinstance(self.action_space, gym.spaces.Box):
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+
+            if callback.on_step() is False:
+                return False
+
+            self._update_info_buffer(infos)
+            n_steps += 1
+            self.num_timesteps += env.num_envs
+
+            if isinstance(self.action_space, gym.spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+            rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)
+            self._last_obs = new_obs
+            self._last_dones = dones
+
+        rollout_buffer.compute_returns_and_advantage(values, dones=dones)
+
+        callback.on_rollout_end()
+
+        return True
+
+class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
+    """
+    
+    The base for using context based On-Policy algorithms. Handles contexts
+
+    Deals with environment returning a dictionary of agent observations. It will be able to determine here if 
+    the agent has died, thanks to dones.
+
+    So the env will take a dict of actions, and return a dict of obs, infos, dones, etc.
+        the dict correlates agent_id to value
+    
+    keep track of agent_id -> index dict, this way we can keep obs as a np.array
+
+    :param policy: (ActorCriticPolicy or str) The policy model to use (MlpPolicy, CnnPolicy, ...)
+    :param env: (Gym environment or str) The environment to learn from (if registered in Gym, can be str)
+    :param learning_rate: (float or callable) The learning rate, it can be a function
+        of the current progress remaining (from 1 to 0)
+    :param n_steps: (int) The number of steps to run for each environment per update
+        (i.e. batch size is n_steps * n_env where n_env is number of environment copies running in parallel)
+    :param gamma: (float) Discount factor
+    :param gae_lambda: (float) Factor for trade-off of bias vs variance for Generalized Advantage Estimator.
+        Equivalent to classic advantage when set to 1.
+    :param ent_coef: (float) Entropy coefficient for the loss calculation
+    :param vf_coef: (float) Value function coefficient for the loss calculation
+    :param max_grad_norm: (float) The maximum value for the gradient clipping
+    :param use_sde: (bool) Whether to use generalized State Dependent Exploration (gSDE)
+        instead of action noise exploration (default: False)
+    :param sde_sample_freq: (int) Sample a new noise matrix every n steps when using gSDE
+        Default: -1 (only sample at the beginning of the rollout)
+    :param tensorboard_log: (str) the log location for tensorboard (if None, no logging)
+    :param create_eval_env: (bool) Whether to create a second environment that will be
+        used for evaluating the agent periodically. (Only available when passing string for the environment)
+    :param monitor_wrapper: When creating an environment, whether to wrap it
+        or not in a Monitor wrapper.
+    :param policy_kwargs: (dict) additional arguments to be passed to the policy on creation
+    :param verbose: (int) the verbosity level: 0 no output, 1 info, 2 debug
+    :param seed: (int) Seed for the pseudo random generators
+    :param device: (str or th.device) Device (cpu, cuda, ...) on which the code should be run.
+        Setting it to auto, the code will be run on the GPU if possible.
+    :param _init_setup_model: (bool) Whether or not to build the network at the creation of the instance
+    """
+
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):
+        print(kwargs)
+        super(ContextOnPolicyAlgorithm, self).__init__(*args, **kwargs)
+
+
+    def collect_rollouts(
+        self, env: VecEnv, callback: BaseCallback, rollout_buffer: TrajRolloutBuffer, n_rollout_steps: int
+    ) -> bool:
+        """
+        Collect rollouts using the current policy and fill a `RolloutBuffer`.
+
+        :param env: (VecEnv) The training environment
+        :param callback: (BaseCallback) Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: (RolloutBuffer) Buffer to fill with rollouts
+        :param n_steps: (int) Number of experiences to collect per environment
+        :return: (bool) True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        n_steps = 0
+        rollout_buffer.reset()
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        # while n_steps < n_rollout_steps:
+        while not rollout_buffer.full:
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor
+                obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
+                # Append the contexts to the obs_tensor
+                # obs_ctx_tensor = th.concatenate([obs_tensor, self._contexts], dim=len(obs_tensor.size)-1)
+                actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
+            actions = actions.cpu().numpy()
+
+            # Rescale and perform action
+            clipped_actions = actions
+            # Clip the actions to avoid out of bound error
+            if isinstance(self.action_space, gym.spaces.Box):
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+            # action_dict = zip(enumerate(clipped_actions))
+            new_obs, rewards, dones, infos = env.step(clipped_actions) # env step takes np.array, returns np.array?
+
+            if callback.on_step() is False:
+                return False
+
+            self._update_info_buffer(infos)
+            n_steps += 1
+            self.num_timesteps += env.num_envs
+
+            if isinstance(self.action_space, gym.spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+            
+            _obs = self._last_obs[...,0:2]
+            _ctx = self._last_obs[...,2:5]
+            # _obs = self._last_obs
+            # _ctx = None
+            # TODO: need to fix in the case of new number of agents
+            for i in range(len(self._last_obs)):
+                rollout_buffer.add(agent_id=i,
+                                context=_ctx[i],
+                                done=self._last_dones[i],
+                                obs=_obs[i],
+                                action=actions[i],
+                                reward=rewards[i],
+                                value=values[i],
+                                log_prob=log_probs[i])
+
+            # TODO: needs modification!
+            # rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)
+            self._last_obs = new_obs
+            self._last_dones = dones
+
+        rollout_buffer.compute_returns_and_advantage(values)
+
+        callback.on_rollout_end()
+
+        return True

@@ -1,5 +1,5 @@
 import warnings
-from typing import Generator, Optional, Union
+from typing import Generator, Optional, Union, Dict, List
 
 import numpy as np
 import torch as th
@@ -171,12 +171,12 @@ class ReplayBuffer(BaseBuffer):
             mem_available = psutil.virtual_memory().available
 
         self.optimize_memory_usage = optimize_memory_usage
-        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+        self.observations = np.zeros((self.buffer_size, self.n_envs,) + self.obs_shape, dtype=observation_space.dtype)
         if optimize_memory_usage:
             # `observations` contains also the next observation
             self.next_observations = None
         else:
-            self.next_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=observation_space.dtype)
+            self.next_observations = np.zeros((self.buffer_size, self.n_envs,) + self.obs_shape, dtype=observation_space.dtype)
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -284,7 +284,7 @@ class RolloutBuffer(BaseBuffer):
         self.reset()
 
     def reset(self) -> None:
-        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=np.float32)
+        self.observations = np.zeros((self.buffer_size, self.n_envs,) + self.obs_shape, dtype=np.float32)
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -381,3 +381,231 @@ class RolloutBuffer(BaseBuffer):
             self.returns[batch_inds].flatten(),
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+
+class TrajectoryBufferSamples():
+
+    def __init__(self, context, gamma, gae_lambda):
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.context = context
+        self.observations : Union[List, np.ndarray]= []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.log_probs = []
+        self.buffer_size = 0
+        self.context_error = None
+
+    def add(self, obs: np.ndarray, action: np.ndarray, reward: np.ndarray, value: th.Tensor, log_prob: th.Tensor
+        ) -> None:
+        self.observations.append(np.array(obs).copy())
+        self.actions.append(np.array(action).copy())
+        self.rewards.append(np.array(reward).copy())
+        self.values.append(value.clone().cpu().numpy().flatten())
+        self.log_probs.append(log_prob.clone().cpu().numpy())
+        self.buffer_size += 1
+
+    def _to_numpy(self):
+        # self.observations = np.array(self.observations)
+        # self.actions = np.array(self.actions)
+        # self.rewards = np.array(self.rewards)
+        # self.values = np.array(self.values)
+        # self.log_probs = np.array(self.log_probs)
+        for l in ["observations", "actions", "values", "log_probs", "rewards"]:
+            self.__dict__[l] = np.array(self.__dict__[l])
+        
+        self.returns = np.zeros((self.buffer_size, 1), dtype=np.float32)
+        self.advantages = np.zeros((self.buffer_size, 1), dtype=np.float32)
+
+    def compute_returns_and_advantage(self, last_value: Union[th.Tensor, None] = None) -> None:
+        """
+        Post-processing step: compute the returns (sum of discounted rewards)
+        and GAE advantage.
+        Adapted from Stable-Baselines PPO2.
+
+        Uses Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+        to compute the advantage. To obtain vanilla advantage (A(s) = R - V(S))
+        where R is the discounted reward with value bootstrap,
+        set ``gae_lambda=1.0`` during initialization.
+
+        :param last_value: (th.Tensor)
+        :param dones: (np.ndarray)
+        """
+        self._to_numpy()
+        # print("Buffer size:", self.buffer_size)
+        # convert to numpy
+        last_value = 0 if not last_value else last_value.clone().cpu().numpy().flatten()
+        
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_value = last_value
+            else:
+                next_value = self.values[step + 1]
+            delta = self.rewards[step] + self.gamma * next_value - self.values[step]
+            last_gae_lam = delta + self.gamma * self.gae_lambda * last_gae_lam
+            self.advantages[step] = last_gae_lam
+        self.returns = self.advantages + self.values
+
+class TrajRolloutBuffer():
+    """
+    Base class that represent a buffer (rollout or replay)
+
+    :param buffer_size: (int) Max number of element in the buffer
+    :param observation_space: (spaces.Space) Observation space
+    :param action_space: (spaces.Space) Action space
+    :param device: (Union[th.device, str]) PyTorch device
+        to which the values will be converted
+    :param n_envs: (int) Number of parallel environments
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "cpu",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        num_trajectories: int = 20
+    ):
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.obs_shape = get_obs_shape(observation_space)
+        self.action_dim = get_action_dim(action_space)
+        self.full = False
+        self.device = device
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+        self.num_trajectories = num_trajectories
+        self.traj_idx = 0
+        self.live_agents : Dict[int, int] = {} # env agent-id -> buffer-unique
+        self.trajectories : Dict[int, TrajectoryBufferSamples] = {} # buffer-unique id -> trajectory
+
+    def size(self) -> int:
+        """
+        :return: (int) The current size of the buffer
+        """
+        if self.full:
+            return self.num_trajectories
+        return self.traj_idx
+
+    def add_context(self, unique_id: int, context: np.ndarray) -> None:
+        # unique_id = self.agent_id_to_unique_id[agent_id]
+        self.trajectories[unique_id]
+
+    def assign_unique_id(self, agent_id:int, context:np.ndarray) -> int:
+        if self.traj_idx == self.num_trajectories:
+            self.full = True
+        self.live_agents[agent_id] = self.traj_idx
+        self.trajectories[self.traj_idx] = TrajectoryBufferSamples(context, self.gamma, self.gae_lambda)
+        self.traj_idx += 1
+        return self.live_agents[agent_id]
+
+    def add(self, agent_id:int, context:np.ndarray, done:np.ndarray, **kwargs) -> None:
+        '''
+        Takes a singular (o, a, r, d, v) group from an agent
+        '''
+        # print(self.live_agents)
+        unique_id = None
+        if agent_id not in self.live_agents:
+            # if this is a new agent, set it's context
+            unique_id = self.assign_unique_id(agent_id, context)
+            # self.add_context(unique_id, context)
+        else:
+            unique_id = self.live_agents[agent_id]
+
+        # if agent dies, remove from the list of live_agents
+        if np.sum(done) == 1:
+            self.live_agents.pop(agent_id)
+        
+        self.trajectories[unique_id].add(**kwargs)
+
+    def reset(self) -> None:
+        """
+        Reset the buffer.
+        """
+        self.traj_idx = 0
+        self.full = False
+        self.unique_id_to_context = {}
+        self.live_agents = {}
+        self.trajectories = {}
+
+    # @staticmethod
+    # def annotate_context_error(trajectories : List[TrajectoryBufferSamples], context_mse: np.ndarray) -> None:
+    #     for t in trajectories:
+    #         t.
+
+    @staticmethod
+    def format_trajectories(trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
+        observations = np.concatenate([t.observations for t in trajectories])
+        # if trajectories[0].context:
+        contexts = np.concatenate([np.broadcast_to(t.context, (t.observations.shape[0],) + t.context.shape) for t in trajectories])
+        observations = np.concatenate([observations, contexts], axis=-1).squeeze()
+        # print("formatting:", observations.shape, contexts.shape, obs_ctx.shape)
+
+        context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
+        actions = np.concatenate([t.actions for t in trajectories]).squeeze()
+        returns = np.concatenate([t.returns for t in trajectories]).squeeze()
+        values = np.concatenate([t.values for t in trajectories]).squeeze()
+        log_probs = np.concatenate([t.log_probs for t in trajectories]).squeeze()
+        advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
+
+        # print(actions.shape, returns.shape, values.shape, log_probs.shape, obs_ctx.shape, advantages.shape)
+
+        indices = np.arange(observations.shape[0])
+        np.random.shuffle(indices)
+
+        data = (
+            observations[indices],
+            actions[indices],
+            values[indices],
+            log_probs[indices],
+            advantages[indices],
+            returns[indices],
+            context_error[indices]
+        )
+        return RolloutBufferSamples(*tuple(map(th.tensor, data)))
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[TrajectoryBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.num_trajectories)
+        # Prepare the data
+        # if not self.generator_ready:
+        #     for tensor in ["observations", "actions", "values", "log_probs", "advantages", "returns"]:
+        #         self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+        #     self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.num_trajectories
+
+        start_idx = 0
+        while start_idx < self.num_trajectories:
+            yield [self.trajectories[i] for i in indices[start_idx : start_idx + batch_size]]
+            start_idx += batch_size
+
+    def compute_returns_and_advantage(self, last_value: Dict[int, th.Tensor]) -> None:
+        done = set([])
+        for agent_id, unique_id in self.live_agents.items():
+            self.trajectories[unique_id].compute_returns_and_advantage(last_value=last_value[agent_id])
+            done.add(unique_id)
+        
+        for unique_id, buffer in self.trajectories.items():
+            if unique_id not in done:
+                buffer.compute_returns_and_advantage()
+
+
+    def to_torch(self, array: np.ndarray, copy: bool = True) -> th.Tensor:
+        """
+        Convert a numpy array to a PyTorch tensor.
+        Note: it copies the data by default
+
+        :param array: (np.ndarray)
+        :param copy: (bool) Whether to copy or not the data
+            (may be useful to avoid changing things be reference)
+        :return: (th.Tensor)
+        """
+        if copy:
+            return th.tensor(array).to(self.device)
+        return th.as_tensor(array).to(self.device)
+

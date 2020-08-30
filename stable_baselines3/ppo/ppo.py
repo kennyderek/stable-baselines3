@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Optional, Type, Union
+from typing import Any, Callable, Dict, Optional, Type, Union, List
 
 import numpy as np
 import torch as th
@@ -6,13 +6,16 @@ from gym import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common import logger
-from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
+from stable_baselines3.common.on_policy_algorithm import ContextOnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
+from stable_baselines3.common.decider import Decider
+from stable_baselines3.common.buffers import TrajectoryBufferSamples
+from torch.nn.utils.rnn import pack_padded_sequence
 
-class PPO(OnPolicyAlgorithm):
+class PPO(ContextOnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
 
@@ -67,8 +70,8 @@ class PPO(OnPolicyAlgorithm):
         policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Callable] = 3e-4,
-        n_steps: int = 2048,
-        batch_size: Optional[int] = 64,
+        n_steps: int = 2000,
+        batch_size: Optional[int] = 5, # THIS IS NOW THE # OF TRAJECTORIES OOP
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -116,6 +119,9 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.target_kl = target_kl
 
+        self.decider : Decider = Decider()
+        self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
+
         if _init_setup_model:
             self._setup_model()
 
@@ -129,6 +135,24 @@ class PPO(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
+
+    def _get_decider_batches(self, trajectory_batch: List[TrajectoryBufferSamples]):
+        self.decision_length = None
+        self.sample_frequency = 10 # TODO: hardcoded
+        observation_shape = trajectory_batch[0].observations.shape[1:] # excludes the length N of the trajectory
+        max_trajectory_length = max(t.buffer_size for t in trajectory_batch)
+        final_length = (max_trajectory_length if self.decision_length == None else self.decision_length)//self.sample_frequency + 1
+        num_trajectories = len(trajectory_batch) # TODO: modify to match decison length
+        
+        lengths = np.zeros((num_trajectories,))
+        trajectories = np.zeros((num_trajectories, final_length,) + observation_shape) # (B, N, Obs)
+        targets = np.zeros((num_trajectories, 3)) # TODO: hardcoded context length
+        for idx, t in enumerate(trajectory_batch):
+            # print(t.observations.shape, t.observations[0:t.buffer_size:self.sample_frequency].shape)
+            trajectories[idx][0:((t.buffer_size - 1)//self.sample_frequency)+1] = t.observations[0:t.buffer_size:self.sample_frequency] # TODO: dehardcode
+            lengths[idx] = t.buffer_size//self.sample_frequency
+            targets[idx] = t.context
+        return trajectories, targets, lengths # (B, N, Obs), # (B, Cnxt), # (B,)
 
     def train(self) -> None:
         """
@@ -144,14 +168,25 @@ class PPO(OnPolicyAlgorithm):
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
 
         entropy_losses, all_kl_divs = [], []
-        pg_losses, value_losses = [], []
+        pg_losses, value_losses, decider_losses = [], [], []
         clip_fractions = []
 
         # train for gradient_steps epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
+            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+                trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
+                t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
+                context_predictions = self.decider(t_packed) # (batch, context_size)
+                context_mse = np.sum(np.square(context_targets - context_predictions.detach().numpy()), axis=-1)
+                context_mse_normalized = (context_mse - context_mse.mean()) / (context_mse.std() + 1e-8)
+                context_mse_normalized = context_mse_normalized.reshape((len(trajectory_batch), 1))
+                for idx, t in enumerate(trajectory_batch):
+                    t.context_error = np.broadcast_to(context_mse_normalized[idx], shape=(t.buffer_size,))
+                
+                rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
+
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
@@ -168,6 +203,7 @@ class PPO(OnPolicyAlgorithm):
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                advantages -= rollout_data.context_error # TODO, change to log, evaluate whether this is correct?
 
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
@@ -214,6 +250,37 @@ class PPO(OnPolicyAlgorithm):
                 self.policy.optimizer.step()
                 approx_kl_divs.append(th.mean(rollout_data.old_log_prob - log_prob).detach().cpu().numpy())
 
+            # Decider update
+            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+                # here, do the Decider pass on each trajectory, and modify trajectory advantage
+                trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
+                t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False)
+                context_predictions = self.decider(t_packed) # (batch, context_size)
+                loss = F.mse_loss(context_predictions, th.tensor(context_targets))
+                decider_losses.append(loss.item())
+                self.decider_opt.zero_grad()
+                loss.backward()
+                self.decider_opt.step()
+                
+
+                # trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
+                # t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False)
+                # context_predictions = self.decider(t_packed) # (batch, context_size)
+                # loss = F.mse_loss(context_predictions, th.tensor(context_targets), reduction='none')
+                
+                # element_wise_error = loss.detach().numpy()
+                # context_mse = np.sum(element_wise_error, axis=-1)/element_wise_error.shape[-1]
+                # context_mse_normalized = (context_mse - context_mse.mean()) / (context_mse.std() + 1e-8)
+                # context_mse_normalized = context_mse_normalized.reshape((len(trajectory_batch), 1))
+                # for idx, t in enumerate(trajectory_batch):
+                #     t.context_error = np.broadcast_to(context_mse_normalized[idx], shape=(t.buffer_size,))
+
+                # loss = th.mean(loss)
+                # decider_losses.append(loss.item())
+                # self.decider_opt.zero_grad()
+                # loss.backward()
+                # self.decider_opt.step()
+
             all_kl_divs.append(np.mean(approx_kl_divs))
 
             if self.target_kl is not None and np.mean(approx_kl_divs) > 1.5 * self.target_kl:
@@ -221,16 +288,17 @@ class PPO(OnPolicyAlgorithm):
                 break
 
         self._n_updates += self.n_epochs
-        explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())
+        # explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())
 
         # Logs
         logger.record("train/entropy_loss", np.mean(entropy_losses))
         logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         logger.record("train/value_loss", np.mean(value_losses))
+        logger.record("train/decider_loss", np.mean(decider_losses))
         logger.record("train/approx_kl", np.mean(approx_kl_divs))
         logger.record("train/clip_fraction", np.mean(clip_fraction))
         logger.record("train/loss", loss.item())
-        logger.record("train/explained_variance", explained_var)
+        # logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
