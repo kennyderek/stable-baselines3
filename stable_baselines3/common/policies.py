@@ -252,8 +252,6 @@ class BasePolicy(BaseModel):
 
         vectorized_env = is_vectorized_observation(observation, self.observation_space)
 
-        observation = observation.reshape((-1,) + self.observation_space.shape)
-
         observation = th.as_tensor(observation).to(self.device)
         with th.no_grad():
             actions = self._predict(observation, deterministic=deterministic)
@@ -269,10 +267,10 @@ class BasePolicy(BaseModel):
                 # out of bound error (e.g. if sampling from a Gaussian distribution)
                 actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
-        if not vectorized_env:
-            if state is not None:
-                raise ValueError("Error: The environment must be vectorized when using recurrent policies.")
-            actions = actions[0]
+        # if not vectorized_env:
+        #     if state is not None:
+        #         raise ValueError("Error: The environment must be vectorized when using recurrent policies.")
+        #     actions = actions[0]
 
         return actions, state
 

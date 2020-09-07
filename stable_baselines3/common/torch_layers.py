@@ -46,7 +46,6 @@ class FlattenExtractor(BaseFeaturesExtractor):
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.flatten(observations)
 
-
 class NatureCNN(BaseFeaturesExtractor):
     """
     CNN from DQN nature paper:

@@ -146,11 +146,12 @@ class BaseAlgorithm(ABC):
                     self.eval_env = maybe_make_env(env, monitor_wrapper, self.verbose)
 
             env = maybe_make_env(env, monitor_wrapper, self.verbose)
-            env = self._wrap_env(env)
+            # env = self._wrap_env(env)
 
             self.observation_space = env.observation_space
             self.action_space = env.action_space
-            self.n_envs = env.num_envs
+            # self.n_envs = env.num_envs
+            self.n_envs = 1
             self.env = env
 
             if not support_multi_env and self.n_envs > 1:
@@ -161,17 +162,17 @@ class BaseAlgorithm(ABC):
         if self.use_sde and not isinstance(self.observation_space, gym.spaces.Box):
             raise ValueError("generalized State-Dependent Exploration (gSDE) can only be used with continuous actions.")
 
-    def _wrap_env(self, env: GymEnv) -> VecEnv:
-        if not isinstance(env, VecEnv):
-            if self.verbose >= 1:
-                print("Wrapping the env in a DummyVecEnv.")
-            env = DummyVecEnv([lambda: env])
+    # def _wrap_env(self, env: GymEnv) -> VecEnv:
+    #     if not isinstance(env, VecEnv):
+    #         if self.verbose >= 1:
+    #             print("Wrapping the env in a DummyVecEnv.")
+    #         env = DummyVecEnv([lambda: env])
 
-        if is_image_space(env.observation_space) and not isinstance(env, VecTransposeImage):
-            if self.verbose >= 1:
-                print("Wrapping the env in a VecTransposeImage.")
-            env = VecTransposeImage(env)
-        return env
+    #     if is_image_space(env.observation_space) and not isinstance(env, VecTransposeImage):
+    #         if self.verbose >= 1:
+    #             print("Wrapping the env in a VecTransposeImage.")
+    #         env = VecTransposeImage(env)
+    #     return env
 
     @abstractmethod
     def _setup_model(self) -> None:
@@ -187,9 +188,9 @@ class BaseAlgorithm(ABC):
         if eval_env is None:
             eval_env = self.eval_env
 
-        if eval_env is not None:
-            eval_env = self._wrap_env(eval_env)
-            assert eval_env.num_envs == 1
+        # if eval_env is not None:
+            # eval_env = self._wrap_env(eval_env)
+            # assert eval_env.num_envs == 1
         return eval_env
 
     def _setup_lr_schedule(self) -> None:
@@ -250,9 +251,10 @@ class BaseAlgorithm(ABC):
         check_for_correct_spaces(env, self.observation_space, self.action_space)
         # it must be coherent now
         # if it is not a VecEnv, make it a VecEnv
-        env = self._wrap_env(env)
+        # env = self._wrap_env(env)
 
-        self.n_envs = env.num_envs
+        # self.n_envs = env.num_envs
+        self.n_envs = 1
         self.env = env
 
     def get_torch_variables(self) -> Tuple[List[str], List[str]]:
@@ -476,7 +478,7 @@ class BaseAlgorithm(ABC):
         if reset_num_timesteps or self._last_obs is None:
             self._last_obs = self.env.reset()
             self._contexts = None
-            self._last_dones = np.zeros((self.env.num_envs,), dtype=np.bool)
+            self._last_dones = np.zeros((self.env.num_agents,), dtype=np.bool) # TODO, configure the 1 to num_envs, have a num_agents var
             # Retrieve unnormalized observation for saving into the buffer
             if self._vec_normalize_env is not None:
                 self._last_original_obs = self._vec_normalize_env.get_original_obs()

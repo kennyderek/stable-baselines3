@@ -398,7 +398,7 @@ class TrajectoryBufferSamples():
 
     def add(self, obs: np.ndarray, action: np.ndarray, reward: np.ndarray, value: th.Tensor, log_prob: th.Tensor
         ) -> None:
-        self.observations.append(np.array(obs).copy())
+        self.observations.append(obs) # this could be a tuple now
         self.actions.append(np.array(action).copy())
         self.rewards.append(np.array(reward).copy())
         self.values.append(value.clone().cpu().numpy().flatten())
@@ -411,6 +411,7 @@ class TrajectoryBufferSamples():
         # self.rewards = np.array(self.rewards)
         # self.values = np.array(self.values)
         # self.log_probs = np.array(self.log_probs)
+
         for l in ["observations", "actions", "values", "log_probs", "rewards"]:
             self.__dict__[l] = np.array(self.__dict__[l])
         
@@ -432,8 +433,6 @@ class TrajectoryBufferSamples():
         :param dones: (np.ndarray)
         """
         self._to_numpy()
-        # print("Buffer size:", self.buffer_size)
-        # convert to numpy
         last_value = 0 if not last_value else last_value.clone().cpu().numpy().flatten()
         
         last_gae_lam = 0
@@ -466,7 +465,7 @@ class TrajRolloutBuffer():
         device: Union[th.device, str] = "cpu",
         gae_lambda: float = 1,
         gamma: float = 0.99,
-        num_trajectories: int = 20
+        num_trajectories: int = 20 # TODO: put as a parameter
     ):
         self.observation_space = observation_space
         self.action_space = action_space
@@ -480,6 +479,7 @@ class TrajRolloutBuffer():
         self.traj_idx = 0
         self.live_agents : Dict[int, int] = {} # env agent-id -> buffer-unique
         self.trajectories : Dict[int, TrajectoryBufferSamples] = {} # buffer-unique id -> trajectory
+        self.num_done_trajectories = 0
 
     def size(self) -> int:
         """
@@ -494,8 +494,6 @@ class TrajRolloutBuffer():
         self.trajectories[unique_id]
 
     def assign_unique_id(self, agent_id:int, context:np.ndarray) -> int:
-        if self.traj_idx == self.num_trajectories:
-            self.full = True
         self.live_agents[agent_id] = self.traj_idx
         self.trajectories[self.traj_idx] = TrajectoryBufferSamples(context, self.gamma, self.gae_lambda)
         self.traj_idx += 1
@@ -505,7 +503,6 @@ class TrajRolloutBuffer():
         '''
         Takes a singular (o, a, r, d, v) group from an agent
         '''
-        # print(self.live_agents)
         unique_id = None
         if agent_id not in self.live_agents:
             # if this is a new agent, set it's context
@@ -516,6 +513,9 @@ class TrajRolloutBuffer():
 
         # if agent dies, remove from the list of live_agents
         if np.sum(done) == 1:
+            self.num_done_trajectories += 1
+            if self.num_done_trajectories == self.num_trajectories:
+                self.full = True
             self.live_agents.pop(agent_id)
         
         self.trajectories[unique_id].add(**kwargs)
@@ -525,55 +525,45 @@ class TrajRolloutBuffer():
         Reset the buffer.
         """
         self.traj_idx = 0
+        self.num_done_trajectories = 0
         self.full = False
         self.unique_id_to_context = {}
         self.live_agents = {}
         self.trajectories = {}
 
-    # @staticmethod
-    # def annotate_context_error(trajectories : List[TrajectoryBufferSamples], context_mse: np.ndarray) -> None:
-    #     for t in trajectories:
-    #         t.
-
     @staticmethod
     def format_trajectories(trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
-        observations = np.concatenate([t.observations for t in trajectories])
-        # if trajectories[0].context:
+        observations = np.concatenate([t.observations for t in trajectories]).squeeze()
         contexts = np.concatenate([np.broadcast_to(t.context, (t.observations.shape[0],) + t.context.shape) for t in trajectories])
         observations = np.concatenate([observations, contexts], axis=-1).squeeze()
-        # print("formatting:", observations.shape, contexts.shape, obs_ctx.shape)
 
-        context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
         actions = np.concatenate([t.actions for t in trajectories]).squeeze()
         returns = np.concatenate([t.returns for t in trajectories]).squeeze()
         values = np.concatenate([t.values for t in trajectories]).squeeze()
         log_probs = np.concatenate([t.log_probs for t in trajectories]).squeeze()
         advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
-
-        # print(actions.shape, returns.shape, values.shape, log_probs.shape, obs_ctx.shape, advantages.shape)
-
-        indices = np.arange(observations.shape[0])
+        try:
+            context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
+        except:
+            context_error = np.zeros(values.shape)
+        
+        indices = np.arange(actions.shape[0])
         np.random.shuffle(indices)
 
         data = (
-            observations[indices],
-            actions[indices],
-            values[indices],
-            log_probs[indices],
-            advantages[indices],
-            returns[indices],
-            context_error[indices]
+            th.tensor(np.expand_dims(observations[indices], 0)),
+            th.tensor(actions[indices]),
+            th.tensor(values[indices]),
+            th.tensor(log_probs[indices]),
+            th.tensor(advantages[indices]),
+            th.tensor(returns[indices]),
+            th.tensor(context_error[indices])
         )
         return RolloutBufferSamples(*tuple(map(th.tensor, data)))
 
     def get(self, batch_size: Optional[int] = None) -> Generator[TrajectoryBufferSamples, None, None]:
         assert self.full, ""
         indices = np.random.permutation(self.num_trajectories)
-        # Prepare the data
-        # if not self.generator_ready:
-        #     for tensor in ["observations", "actions", "values", "log_probs", "advantages", "returns"]:
-        #         self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
-        #     self.generator_ready = True
 
         # Return everything, don't create minibatches
         if batch_size is None:

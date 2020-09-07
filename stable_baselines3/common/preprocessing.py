@@ -42,7 +42,7 @@ def is_image_space(observation_space: spaces.Space, channels_last: bool = True, 
         return n_channels in [1, 3, 4]
     return False
 
-
+# Preprocessing is run in ActorCritic extract_features() function. ActorCritic is the self.policy of PPO.
 def preprocess_obs(obs: th.Tensor, observation_space: spaces.Space, normalize_images: bool = True) -> th.Tensor:
     """
     Preprocess observation to be to a neural network.
@@ -77,6 +77,18 @@ def preprocess_obs(obs: th.Tensor, observation_space: spaces.Space, normalize_im
     elif isinstance(observation_space, spaces.MultiBinary):
         return obs.float()
 
+    elif isinstance(observation_space, spaces.Tuple):
+        # This would probably not work if the inner obs spaces were images.
+        # We need to flatten every inner obs to get the shape (1, x)
+        # for idx in range(len(observation_space)):
+        #     print(preprocess_obs(obs[idx], observation_space[idx]).shape)
+        return th.cat(
+            [
+                preprocess_obs(obs[idx], observation_space[idx])
+                for idx in range(len(observation_space))
+            ],
+            dim=-1,
+        )
     else:
         raise NotImplementedError()
 
@@ -99,6 +111,8 @@ def get_obs_shape(observation_space: spaces.Space) -> Tuple[int, ...]:
     elif isinstance(observation_space, spaces.MultiBinary):
         # Number of binary features
         return (int(observation_space.n),)
+    elif isinstance(observation_space, spaces.Tuple):
+        return (sum([get_obs_shape(subobs)[0] for subobs in observation_space]),)
     else:
         raise NotImplementedError()
 
@@ -115,6 +129,8 @@ def get_flattened_obs_dim(observation_space: spaces.Space) -> int:
     # it may be a problem for Dict/Tuple spaces too...
     if isinstance(observation_space, spaces.MultiDiscrete):
         return sum(observation_space.nvec)
+    if isinstance(observation_space, spaces.Tuple):
+        return sum([get_flattened_obs_dim(subspace) for subspace in observation_space])
     else:
         # Use Gym internal method
         return spaces.utils.flatdim(observation_space)

@@ -111,7 +111,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.device,
             gae_lambda=self.gae_lambda,
             gamma=self.gamma,
-            num_trajectories=20
+            num_trajectories=50 # TODO: need to make more easily configurable
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -119,7 +119,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.action_space,
             self.lr_schedule,
             use_sde=self.use_sde,
-            device=self.device,
+            # device=self.device,
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
@@ -388,7 +388,12 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
 
             with th.no_grad():
                 # Convert to pytorch tensor
-                obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
+                # print(self._last_obs)
+                if isinstance(self.observation_space, gym.spaces.Tuple):
+                    obs_ctx_tensor = tuple(map(lambda x: th.as_tensor(x).to(self.device), self._last_obs))
+                else:
+                    obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
+                
                 # Append the contexts to the obs_tensor
                 # obs_ctx_tensor = th.concatenate([obs_tensor, self._contexts], dim=len(obs_tensor.size)-1)
                 actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
@@ -403,22 +408,27 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             # action_dict = zip(enumerate(clipped_actions))
             new_obs, rewards, dones, infos = env.step(clipped_actions) # env step takes np.array, returns np.array?
 
+            # TODO: figure out where to put this reset: maybe in an env wrapper like they did
+            if dones[self.env.num_agents] == 1:
+                env.reset()
+
             if callback.on_step() is False:
                 return False
 
             self._update_info_buffer(infos)
             n_steps += 1
-            self.num_timesteps += env.num_envs
+            # self.num_timesteps += env.num_envs
+            self.num_timesteps += 1
 
             if isinstance(self.action_space, gym.spaces.Discrete):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
             
-            _obs = self._last_obs[...,0:2]
-            _ctx = self._last_obs[...,2:5]
-            # _obs = self._last_obs
-            # _ctx = None
-            # TODO: need to fix in the case of new number of agents
+
+            _obs = self._last_obs[0][...,0:2]
+            _ctx = self._last_obs[0][...,2:5]
+
+            # TODO: need to fix in the case of new number of agents, since range(len(last_obs)) will be incorrect
             for i in range(len(self._last_obs)):
                 rollout_buffer.add(agent_id=i,
                                 context=_ctx[i],
@@ -428,6 +438,17 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                                 reward=rewards[i],
                                 value=values[i],
                                 log_prob=log_probs[i])
+            # for i, state_ctx_pair in enumerate(zip(*_obs, _ctx)):
+            #     print(state_ctx_pair)
+            #     rollout_buffer.add(agent_id=i,
+            #                     context=state_ctx_pair[-1],
+            #                     done=self._last_dones[i],
+            #                     obs=state_ctx_pair[0:-1],
+            #                     action=actions[i],
+            #                     reward=rewards[i],
+            #                     value=values[i],
+            #                     log_prob=log_probs[i])
+
 
             # TODO: needs modification!
             # rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)

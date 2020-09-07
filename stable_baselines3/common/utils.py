@@ -225,6 +225,7 @@ def is_vectorized_observation(observation: np.ndarray, observation_space: gym.sp
     :param observation_space: (gym.spaces) the observation space
     :return: (bool) whether the given observation is vectorized or not
     """
+    return False # TODO: super hack: no more vectorized operations
     if isinstance(observation_space, gym.spaces.Box):
         if observation.shape == observation_space.shape:
             return False
