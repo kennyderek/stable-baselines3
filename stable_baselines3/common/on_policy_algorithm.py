@@ -111,7 +111,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.device,
             gae_lambda=self.gae_lambda,
             gamma=self.gamma,
-            num_trajectories=50 # TODO: need to make more easily configurable
+            num_trajectories=500 # TODO: need to make more easily configurable
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -388,14 +388,7 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
 
             with th.no_grad():
                 # Convert to pytorch tensor
-                # print(self._last_obs)
-                if isinstance(self.observation_space, gym.spaces.Tuple):
-                    obs_ctx_tensor = tuple(map(lambda x: th.as_tensor(x).to(self.device), self._last_obs))
-                else:
-                    obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
-                
-                # Append the contexts to the obs_tensor
-                # obs_ctx_tensor = th.concatenate([obs_tensor, self._contexts], dim=len(obs_tensor.size)-1)
+                obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
                 actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
             actions = actions.cpu().numpy()
 
@@ -424,9 +417,8 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
             
-
-            _obs = self._last_obs[0][...,0:2]
-            _ctx = self._last_obs[0][...,2:5]
+            _obs = self._last_obs[...,0:self.env.obs_size]
+            _ctx = self._last_obs[...,self.env.obs_size:]
 
             # TODO: need to fix in the case of new number of agents, since range(len(last_obs)) will be incorrect
             for i in range(len(self._last_obs)):

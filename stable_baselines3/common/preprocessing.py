@@ -81,7 +81,6 @@ def preprocess_obs(obs: th.Tensor, observation_space: spaces.Space, normalize_im
         # This would probably not work if the inner obs spaces were images.
         # We need to flatten every inner obs to get the shape (1, x)
         # for idx in range(len(observation_space)):
-        #     print(preprocess_obs(obs[idx], observation_space[idx]).shape)
         return th.cat(
             [
                 preprocess_obs(obs[idx], observation_space[idx])
@@ -104,7 +103,7 @@ def get_obs_shape(observation_space: spaces.Space) -> Tuple[int, ...]:
         return observation_space.shape
     elif isinstance(observation_space, spaces.Discrete):
         # Observation is an int
-        return (1,)
+        return (observation_space.n,) # TODO, fix
     elif isinstance(observation_space, spaces.MultiDiscrete):
         # Number of discrete features
         return (int(len(observation_space.nvec)),)

@@ -551,7 +551,7 @@ class TrajRolloutBuffer():
         np.random.shuffle(indices)
 
         data = (
-            th.tensor(np.expand_dims(observations[indices], 0)),
+            th.tensor(observations[indices]),
             th.tensor(actions[indices]),
             th.tensor(values[indices]),
             th.tensor(log_probs[indices]),
