@@ -106,7 +106,7 @@ def get_obs_shape(observation_space: spaces.Space) -> Tuple[int, ...]:
         return (observation_space.n,) # TODO, fix
     elif isinstance(observation_space, spaces.MultiDiscrete):
         # Number of discrete features
-        return (int(len(observation_space.nvec)),)
+        return (int(sum(observation_space.nvec)),) # TODO, also a patch
     elif isinstance(observation_space, spaces.MultiBinary):
         # Number of binary features
         return (int(observation_space.n),)

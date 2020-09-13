@@ -111,7 +111,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.device,
             gae_lambda=self.gae_lambda,
             gamma=self.gamma,
-            num_trajectories=500 # TODO: need to make more easily configurable
+            num_trajectories=300 # TODO: need to make more easily configurable
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -296,6 +296,8 @@ class OnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             if isinstance(self.action_space, gym.spaces.Discrete):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
+            
+            # NOW USING DICT REPS FOR REWARDS, OBS, ACTIONS, DONES, ETC
             rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)
             self._last_obs = new_obs
             self._last_dones = dones
@@ -348,6 +350,30 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
     :param _init_setup_model: (bool) Whether or not to build the network at the creation of the instance
     """
 
+    @staticmethod
+    def dict_obs_to_array(d_obs : Dict[int, np.ndarray], key_list : List[int]):
+        '''
+        Assumes len d_obs and key_list > 1
+        Turns a dictionary d_obs of int->array into a single array a, where
+        index i of a is d_obs[key_list[i]]
+        '''
+        len_obs = len(d_obs[key_list[0]]) # get the length of the observation
+        a = np.zeros((len(key_list), len_obs))
+        for idx, mapping in enumerate(key_list):
+            a[idx] = d_obs[mapping]
+        return a
+
+    @staticmethod
+    def array_to_dict_actions(arr_actions : np.ndarray, key_list : List[int]):
+        '''
+        Perform the reverse of dict_obs_to_array
+        Turns an array of actions into a dictionary, where action i of a 
+        '''
+        d_actions = {}
+        for idx, mapping in enumerate(key_list):
+            d_actions[mapping] = arr_actions[idx]
+        return d_actions
+
     def __init__(
         self,
         *args,
@@ -386,11 +412,17 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
+            key_list = list(self._last_obs.keys()) # keep this to map from dictionaries of actions/obs to contiguous arrays
+
             with th.no_grad():
                 # Convert to pytorch tensor
-                obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
+                obs_ctx_tensor = th.as_tensor(self.dict_obs_to_array(self._last_obs, key_list)).to(self.device)
+                # obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
                 actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
             actions = actions.cpu().numpy()
+            dict_actions = self.array_to_dict_actions(actions, key_list)
+            dict_values = self.array_to_dict_actions(values, key_list)
+            dict_log_probs = self.array_to_dict_actions(log_probs, key_list)
 
             # Rescale and perform action
             clipped_actions = actions
@@ -399,10 +431,11 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             # action_dict = zip(enumerate(clipped_actions))
-            new_obs, rewards, dones, infos = env.step(clipped_actions) # env step takes np.array, returns np.array?
+            dict_clipped_actions = self.array_to_dict_actions(clipped_actions, key_list)
+            new_obs, rewards, dones, infos = env.step(dict_clipped_actions) # env step takes np.array, returns np.array?
 
             # TODO: figure out where to put this reset: maybe in an env wrapper like they did
-            if dones[self.env.num_agents] == 1:
+            if dones[-1] == 1: # -1 is the done for the whole environment?
                 env.reset()
 
             if callback.on_step() is False:
@@ -417,33 +450,17 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
             
-            _obs = self._last_obs[...,0:self.env.obs_size]
-            _ctx = self._last_obs[...,self.env.obs_size:]
-
             # TODO: need to fix in the case of new number of agents, since range(len(last_obs)) will be incorrect
-            for i in range(len(self._last_obs)):
-                rollout_buffer.add(agent_id=i,
-                                context=_ctx[i],
-                                done=self._last_dones[i],
-                                obs=_obs[i],
-                                action=actions[i],
-                                reward=rewards[i],
-                                value=values[i],
-                                log_prob=log_probs[i])
-            # for i, state_ctx_pair in enumerate(zip(*_obs, _ctx)):
-            #     print(state_ctx_pair)
-            #     rollout_buffer.add(agent_id=i,
-            #                     context=state_ctx_pair[-1],
-            #                     done=self._last_dones[i],
-            #                     obs=state_ctx_pair[0:-1],
-            #                     action=actions[i],
-            #                     reward=rewards[i],
-            #                     value=values[i],
-            #                     log_prob=log_probs[i])
+            for agent_id, obs_val in self._last_obs.items():
+                rollout_buffer.add(agent_id=agent_id,
+                                context=obs_val[0:self.env.obs_size],
+                                done=self._last_dones[agent_id],
+                                obs=obs_val[self.env.obs_size:],
+                                action=dict_actions[agent_id],
+                                reward=rewards.get(agent_id, 0),
+                                value=dict_values.get(agent_id, 0),
+                                log_prob=dict_log_probs.get(agent_id, -100000))
 
-
-            # TODO: needs modification!
-            # rollout_buffer.add(self._last_obs, actions, rewards, self._last_dones, values, log_probs)
             self._last_obs = new_obs
             self._last_dones = dones
 

@@ -170,7 +170,7 @@ class PPO(ContextOnPolicyAlgorithm):
         pg_losses, value_losses, decider_losses = [], [], []
         clip_fractions = []
 
-        decider = True # TODO: SET BETTER CONTEXT USAGE TOGGLE
+        decider = False # TODO: SET BETTER CONTEXT USAGE TOGGLE
         # train for gradient_steps epochs
         error_determined = False
         for epoch in range(self.n_epochs):
@@ -191,8 +191,9 @@ class PPO(ContextOnPolicyAlgorithm):
                 
                 rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
 
-                scaled_context_error = rollout_data.context_error * F.softmax(-rollout_data.advantages)
-                scaled_context_error = (scaled_context_error - scaled_context_error.mean()) / (scaled_context_error.std() + 1e-8)
+                # scaled_context_error = rollout_data.context_error * F.softmax(rollout_data.advantages)
+                # scaled_context_error = (scaled_context_error - scaled_context_error.mean()) / (scaled_context_error.std() + 1e-8)
+                scaled_context_error = rollout_data.context_error
 
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):

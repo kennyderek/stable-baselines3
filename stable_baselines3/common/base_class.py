@@ -478,7 +478,9 @@ class BaseAlgorithm(ABC):
         if reset_num_timesteps or self._last_obs is None:
             self._last_obs = self.env.reset()
             self._contexts = None
-            self._last_dones = np.zeros((self.env.num_agents,), dtype=np.bool) # TODO, configure the 1 to num_envs, have a num_agents var
+            # self._last_dones = np.zeros((self.env.num_agents,), dtype=np.bool) # TODO, configure the 1 to num_envs, have a num_agents var
+            self._last_dones = {i:np.array([0]) for i in range(self.env.num_agents)}
+            
             # Retrieve unnormalized observation for saving into the buffer
             if self._vec_normalize_env is not None:
                 self._last_original_obs = self._vec_normalize_env.get_original_obs()
