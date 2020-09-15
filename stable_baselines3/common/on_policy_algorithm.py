@@ -111,7 +111,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.device,
             gae_lambda=self.gae_lambda,
             gamma=self.gamma,
-            num_trajectories=300 # TODO: need to make more easily configurable
+            num_trajectories=30 # TODO: need to make more easily configurable
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -357,8 +357,8 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
         Turns a dictionary d_obs of int->array into a single array a, where
         index i of a is d_obs[key_list[i]]
         '''
-        len_obs = len(d_obs[key_list[0]]) # get the length of the observation
-        a = np.zeros((len(key_list), len_obs))
+        obs_shape = d_obs[key_list[0]].shape # get the length of the observation
+        a = np.zeros((len(key_list),) + obs_shape)
         for idx, mapping in enumerate(key_list):
             a[idx] = d_obs[mapping]
         return a
@@ -417,7 +417,6 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor
                 obs_ctx_tensor = th.as_tensor(self.dict_obs_to_array(self._last_obs, key_list)).to(self.device)
-                # obs_ctx_tensor = th.as_tensor(self._last_obs).to(self.device) # (num_agents,) + (obs_dim,)
                 actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
             actions = actions.cpu().numpy()
             dict_actions = self.array_to_dict_actions(actions, key_list)
@@ -432,11 +431,7 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
 
             # action_dict = zip(enumerate(clipped_actions))
             dict_clipped_actions = self.array_to_dict_actions(clipped_actions, key_list)
-            new_obs, rewards, dones, infos = env.step(dict_clipped_actions) # env step takes np.array, returns np.array?
-
-            # TODO: figure out where to put this reset: maybe in an env wrapper like they did
-            if dones[-1] == 1: # -1 is the done for the whole environment?
-                env.reset()
+            new_obs, rewards, dones, infos = env.step(dict_clipped_actions) # env step takes dicts, returns dicts
 
             if callback.on_step() is False:
                 return False
@@ -451,16 +446,31 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 actions = actions.reshape(-1, 1)
             
             # TODO: need to fix in the case of new number of agents, since range(len(last_obs)) will be incorrect
+
+            # this adds the last obs, current act, and current reward
+            # so what happens if an agent dies right now?
+                # it will append the previous obs, with current action and the reward from the death. This is good!
+                # that means we should delete the newest obs, delete the newest dones.
             for agent_id, obs_val in self._last_obs.items():
                 rollout_buffer.add(agent_id=agent_id,
-                                context=obs_val[0:self.env.obs_size],
+                                context=obs_val[0:self.env.obs_size], # TODO, this needs to be cntx size not obs
                                 done=self._last_dones[agent_id],
-                                obs=obs_val[self.env.obs_size:],
+                                obs=obs_val, # TODO: fix how we pass contexts, obs
                                 action=dict_actions[agent_id],
-                                reward=rewards.get(agent_id, 0),
-                                value=dict_values.get(agent_id, 0),
-                                log_prob=dict_log_probs.get(agent_id, -100000))
-
+                                reward=rewards[agent_id],
+                                value=dict_values[agent_id],
+                                log_prob=dict_log_probs[agent_id])
+            if np.sum(dones[-1]) == 1:
+                new_obs = env.reset()
+                for agent_id, done in dones.items():
+                    rollout_buffer.sig_kill(agent_id)
+                dones = {i:np.array([0]) for i in new_obs.keys()}
+            else:
+                for agent_id, done in dones.items():
+                    if agent_id >= 0 and np.sum(done) == 1:
+                        del new_obs[agent_id] # we do this so the policy does not produce an action even after the agent has died
+                        # rollout_buffer.sig_kill(agent_id)
+                        dones[agent_id] = 0
             self._last_obs = new_obs
             self._last_dones = dones
 

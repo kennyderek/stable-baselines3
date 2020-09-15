@@ -38,6 +38,7 @@ def is_image_space(observation_space: spaces.Space, channels_last: bool = True, 
             n_channels = observation_space.shape[-1]
         else:
             n_channels = observation_space.shape[0]
+            print(n_channels)
         # RGB, RGBD, GrayScale
         return n_channels in [1, 3, 4]
     return False

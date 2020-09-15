@@ -119,8 +119,10 @@ class PPO(ContextOnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.target_kl = target_kl
 
-        self.decider : Decider = Decider(env.obs_size, env.context_size)
-        self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
+        # self.decider : Decider = Decider(env.obs_size, env.context_size)
+        # self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
+        self.decider = None
+        self.decder_opt = None
 
         if _init_setup_model:
             self._setup_model()
@@ -172,6 +174,7 @@ class PPO(ContextOnPolicyAlgorithm):
 
         decider = False # TODO: SET BETTER CONTEXT USAGE TOGGLE
         # train for gradient_steps epochs
+        num_steps_in_epoch = 0
         error_determined = False
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
@@ -190,7 +193,7 @@ class PPO(ContextOnPolicyAlgorithm):
                     # print([t.advantages for t in trajectories])
                 
                 rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
-
+                num_steps_in_epoch += rollout_data.actions.shape[0]
                 # scaled_context_error = rollout_data.context_error * F.softmax(rollout_data.advantages)
                 # scaled_context_error = (scaled_context_error - scaled_context_error.mean()) / (scaled_context_error.std() + 1e-8)
                 scaled_context_error = rollout_data.context_error
@@ -282,6 +285,7 @@ class PPO(ContextOnPolicyAlgorithm):
         # explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())
 
         # Logs
+        logger.record("train/num_steps_in_epoch", num_steps_in_epoch/self.n_epochs)
         logger.record("train/entropy_loss", np.mean(entropy_losses))
         logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         logger.record("train/value_loss", np.mean(value_losses))

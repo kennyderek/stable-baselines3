@@ -499,6 +499,16 @@ class TrajRolloutBuffer():
         self.traj_idx += 1
         return self.live_agents[agent_id]
 
+    def sig_kill(self, agent_id:int) -> None:
+        '''
+        To be used when an agent dies, as indicated by its done signal
+        '''
+        if agent_id in self.live_agents:
+            self.num_done_trajectories += 1
+            if self.num_done_trajectories == self.num_trajectories:
+                self.full = True
+            self.live_agents.pop(agent_id)
+
     def add(self, agent_id:int, context:np.ndarray, done:np.ndarray, **kwargs) -> None:
         '''
         Takes a singular (o, a, r, d, v) group from an agent
@@ -535,8 +545,8 @@ class TrajRolloutBuffer():
     def format_trajectories(trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
         observations = np.concatenate([t.observations for t in trajectories]).squeeze()
         contexts = np.concatenate([np.broadcast_to(t.context, (t.observations.shape[0],) + t.context.shape) for t in trajectories])
-        observations = np.concatenate([observations, contexts], axis=-1).squeeze()
-
+        # observations = np.concatenate([observations, contexts], axis=-1).squeeze() # TODO figure out a way to re-integrate contexts
+        # print("OBBS:", observations.shape)
         actions = np.concatenate([t.actions for t in trajectories]).squeeze()
         returns = np.concatenate([t.returns for t in trajectories]).squeeze()
         values = np.concatenate([t.values for t in trajectories]).squeeze()
@@ -571,6 +581,9 @@ class TrajRolloutBuffer():
 
         start_idx = 0
         while start_idx < self.num_trajectories:
+            # for i in indices[start_idx : start_idx + batch_size]:
+            #     # print("gathering batch of trajectory lengths: ", list(self.trajectories[i].buffer_size for i in indices[start_idx:start_idx+batch_size]))
+            #     print()
             yield [self.trajectories[i] for i in indices[start_idx : start_idx + batch_size]]
             start_idx += batch_size
 
