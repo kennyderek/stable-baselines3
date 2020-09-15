@@ -541,8 +541,7 @@ class TrajRolloutBuffer():
         self.live_agents = {}
         self.trajectories = {}
 
-    @staticmethod
-    def format_trajectories(trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
+    def format_trajectories(self, trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
         observations = np.concatenate([t.observations for t in trajectories]).squeeze()
         contexts = np.concatenate([np.broadcast_to(t.context, (t.observations.shape[0],) + t.context.shape) for t in trajectories])
         # observations = np.concatenate([observations, contexts], axis=-1).squeeze() # TODO figure out a way to re-integrate contexts
@@ -561,15 +560,15 @@ class TrajRolloutBuffer():
         np.random.shuffle(indices)
 
         data = (
-            th.tensor(observations[indices]),
-            th.tensor(actions[indices]),
-            th.tensor(values[indices]),
-            th.tensor(log_probs[indices]),
-            th.tensor(advantages[indices]),
-            th.tensor(returns[indices]),
-            th.tensor(context_error[indices])
+            observations[indices],
+            actions[indices],
+            values[indices],
+            log_probs[indices],
+            advantages[indices],
+            returns[indices],
+            context_error[indices]
         )
-        return RolloutBufferSamples(*tuple(map(th.tensor, data)))
+        return RolloutBufferSamples(*tuple(map(lambda x: th.as_tensor(x).to(self.device), data)))
 
     def get(self, batch_size: Optional[int] = None) -> Generator[TrajectoryBufferSamples, None, None]:
         assert self.full, ""

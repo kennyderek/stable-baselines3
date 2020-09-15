@@ -120,6 +120,7 @@ class PPO(ContextOnPolicyAlgorithm):
         self.target_kl = target_kl
 
         # self.decider : Decider = Decider(env.obs_size, env.context_size)
+        # self.decider.to(self.device)
         # self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
         self.decider = None
         self.decder_opt = None
@@ -183,8 +184,10 @@ class PPO(ContextOnPolicyAlgorithm):
                 if decider and not error_determined:
                     trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
                     t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
+                    t_packed = t_packed.to(self.device)
                     context_predictions = self.decider(t_packed) # (batch, context_size)
-                    context_mse = np.sum(np.square(context_targets - context_predictions.detach().numpy()), axis=-1)
+                    # context_targets = context_targets.to(self.device)
+                    context_mse = np.sum(np.square(context_targets - context_predictions.cpu().detach().numpy()), axis=-1)
                     context_mse_normalized = (context_mse - context_mse.mean()) / (context_mse.std() + 1e-8)
                     context_mse_normalized = context_mse_normalized.reshape((len(trajectory_batch), 1))
                     for idx, t in enumerate(trajectory_batch):
@@ -209,7 +212,9 @@ class PPO(ContextOnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
+                # print("rollout obs:", rollout)
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                # print(values.device)
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -261,7 +266,7 @@ class PPO(ContextOnPolicyAlgorithm):
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
                 approx_kl_divs.append(th.mean(rollout_data.old_log_prob - log_prob).detach().cpu().numpy())
-                    
+                
             all_kl_divs.append(np.mean(approx_kl_divs))
 
             if self.target_kl is not None and np.mean(approx_kl_divs) > 1.5 * self.target_kl:
@@ -274,8 +279,9 @@ class PPO(ContextOnPolicyAlgorithm):
                     # here, do the Decider pass on each trajectory, and modify trajectory advantage
                     trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
                     t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False)
+                    t_packed = t_packed.to(self.device)
                     context_predictions = self.decider(t_packed) # (batch, context_size)
-                    loss = F.mse_loss(context_predictions, th.tensor(context_targets))
+                    loss = F.mse_loss(context_predictions, th.tensor(context_targets).to(self.device))
                     decider_losses.append(loss.item())
                     self.decider_opt.zero_grad()
                     loss.backward()
