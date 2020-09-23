@@ -1,21 +1,21 @@
-from typing import Any, Callable, Dict, Optional, Type, Union, List
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy as np
 import torch as th
 from gym import spaces
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 
 from stable_baselines3.common import logger
-from stable_baselines3.common.on_policy_algorithm import ContextOnPolicyAlgorithm
+from stable_baselines3.common.buffers import TrajectoryBufferSamples, TrajRolloutBuffer
+from stable_baselines3.common.decider import Decider
+from stable_baselines3.common.on_policy_algorithm import TrajectoryOnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
-from stable_baselines3.common.decider import Decider
-from stable_baselines3.common.buffers import TrajectoryBufferSamples
-from torch.nn.utils.rnn import pack_padded_sequence
 
-class PPO(ContextOnPolicyAlgorithm):
+class PPO(TrajectoryOnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
 
@@ -70,9 +70,9 @@ class PPO(ContextOnPolicyAlgorithm):
         policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Callable] = 3e-4,
-        n_steps: int = 2000,
-        batch_size: Optional[int] = 10, # THIS IS NOW THE # OF TRAJECTORIES per grad update
-        n_epochs: int = 10,
+        n_trajectories: int = 50, # total number of trajectories to collect in each buffer
+        batch_size: Optional[int] = 10, # this is now # OF TRAJECTORIES per grad update
+        n_epochs: int = 10, # number of times to loop over all of the data
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: float = 0.2,
@@ -90,13 +90,14 @@ class PPO(ContextOnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        rollout_buffer = TrajRolloutBuffer
     ):
 
         super(PPO, self).__init__(
             policy,
             env,
             learning_rate=learning_rate,
-            n_steps=n_steps,
+            n_trajectories=n_trajectories,
             gamma=gamma,
             gae_lambda=gae_lambda,
             ent_coef=ent_coef,
@@ -111,6 +112,8 @@ class PPO(ContextOnPolicyAlgorithm):
             create_eval_env=create_eval_env,
             seed=seed,
             _init_setup_model=False,
+            rollout_buffer=rollout_buffer,
+            use_context = False
         )
 
         self.batch_size = batch_size
@@ -118,6 +121,7 @@ class PPO(ContextOnPolicyAlgorithm):
         self.clip_range = clip_range
         self.clip_range_vf = clip_range_vf
         self.target_kl = target_kl
+        self.use_context = False
 
         # self.decider : Decider = Decider(env.obs_size, env.context_size)
         # self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
@@ -180,7 +184,7 @@ class PPO(ContextOnPolicyAlgorithm):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                if decider and not error_determined:
+                if self.use_context:
                     trajectories, context_targets, lengths = self._get_decider_batches(trajectory_batch)
                     t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
                     context_predictions = self.decider(t_packed) # (batch, context_size)
@@ -194,9 +198,6 @@ class PPO(ContextOnPolicyAlgorithm):
                 
                 rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
                 num_steps_in_epoch += rollout_data.actions.shape[0]
-                # scaled_context_error = rollout_data.context_error * F.softmax(rollout_data.advantages)
-                # scaled_context_error = (scaled_context_error - scaled_context_error.mean()) / (scaled_context_error.std() + 1e-8)
-                scaled_context_error = rollout_data.context_error
 
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
@@ -214,8 +215,8 @@ class PPO(ContextOnPolicyAlgorithm):
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                if decider:
-                    advantages -= scaled_context_error # TODO, change to log, evaluate whether this is correct?
+                if self.use_context:
+                    advantages -= rollout_data.context_error # TODO, change to log, evaluate whether this is correct?
 
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
@@ -285,7 +286,7 @@ class PPO(ContextOnPolicyAlgorithm):
         # explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())
 
         # Logs
-        logger.record("train/num_steps_in_epoch", num_steps_in_epoch/self.n_epochs)
+        logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
         logger.record("train/entropy_loss", np.mean(entropy_losses))
         logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         logger.record("train/value_loss", np.mean(value_losses))

@@ -14,6 +14,7 @@ except ImportError:
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.type_aliases import ReplayBufferSamples, RolloutBufferSamples
 from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env.vec_transpose import VecTransposeImage
 
 
 class BaseBuffer(object):
@@ -384,7 +385,7 @@ class RolloutBuffer(BaseBuffer):
 
 class TrajectoryBufferSamples():
 
-    def __init__(self, context, gamma, gae_lambda):
+    def __init__(self, context, gamma, gae_lambda, use_context = True):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.context = context
@@ -395,6 +396,7 @@ class TrajectoryBufferSamples():
         self.log_probs = []
         self.buffer_size = 0
         self.context_error = None
+        self.use_context = use_context
 
     def add(self, obs: np.ndarray, action: np.ndarray, reward: np.ndarray, value: th.Tensor, log_prob: th.Tensor
         ) -> None:
@@ -460,12 +462,13 @@ class TrajRolloutBuffer():
 
     def __init__(
         self,
+        num_trajectories: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
         device: Union[th.device, str] = "cpu",
         gae_lambda: float = 1,
         gamma: float = 0.99,
-        num_trajectories: int = 20 # TODO: put as a parameter
+        use_context:bool = False
     ):
         self.observation_space = observation_space
         self.action_space = action_space
@@ -480,6 +483,7 @@ class TrajRolloutBuffer():
         self.live_agents : Dict[int, int] = {} # env agent-id -> buffer-unique
         self.trajectories : Dict[int, TrajectoryBufferSamples] = {} # buffer-unique id -> trajectory
         self.num_done_trajectories = 0
+        self.use_context = False
 
     def size(self) -> int:
         """
@@ -495,7 +499,10 @@ class TrajRolloutBuffer():
 
     def assign_unique_id(self, agent_id:int, context:np.ndarray) -> int:
         self.live_agents[agent_id] = self.traj_idx
-        self.trajectories[self.traj_idx] = TrajectoryBufferSamples(context, self.gamma, self.gae_lambda)
+        if self.use_context:
+            self.trajectories[self.traj_idx] = TrajectoryBufferSamples(context, self.gamma, self.gae_lambda)
+        else:
+            self.trajectories[self.traj_idx] = TrajectoryBufferSamples(context, self.gamma, self.gae_lambda, False)
         self.traj_idx += 1
         return self.live_agents[agent_id]
 
@@ -509,7 +516,7 @@ class TrajRolloutBuffer():
                 self.full = True
             self.live_agents.pop(agent_id)
 
-    def add(self, agent_id:int, context:np.ndarray, done:np.ndarray, **kwargs) -> None:
+    def add(self, agent_id:int, context:np.ndarray, done:bool, **kwargs) -> None:
         '''
         Takes a singular (o, a, r, d, v) group from an agent
         '''
@@ -517,12 +524,11 @@ class TrajRolloutBuffer():
         if agent_id not in self.live_agents:
             # if this is a new agent, set it's context
             unique_id = self.assign_unique_id(agent_id, context)
-            # self.add_context(unique_id, context)
         else:
             unique_id = self.live_agents[agent_id]
 
         # if agent dies, remove from the list of live_agents
-        if np.sum(done) == 1:
+        if done:
             self.num_done_trajectories += 1
             if self.num_done_trajectories == self.num_trajectories:
                 self.full = True
@@ -541,35 +547,31 @@ class TrajRolloutBuffer():
         self.live_agents = {}
         self.trajectories = {}
 
-    @staticmethod
-    def format_trajectories(trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
+    def format_trajectories(self, trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
         observations = np.concatenate([t.observations for t in trajectories]).squeeze()
-        contexts = np.concatenate([np.broadcast_to(t.context, (t.observations.shape[0],) + t.context.shape) for t in trajectories])
-        # observations = np.concatenate([observations, contexts], axis=-1).squeeze() # TODO figure out a way to re-integrate contexts
-        # print("OBBS:", observations.shape)
         actions = np.concatenate([t.actions for t in trajectories]).squeeze()
         returns = np.concatenate([t.returns for t in trajectories]).squeeze()
         values = np.concatenate([t.values for t in trajectories]).squeeze()
         log_probs = np.concatenate([t.log_probs for t in trajectories]).squeeze()
         advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
-        try:
+        if self.use_context:
             context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
-        except:
+        else:
             context_error = np.zeros(values.shape)
         
         indices = np.arange(actions.shape[0])
         np.random.shuffle(indices)
 
         data = (
-            th.tensor(observations[indices]),
-            th.tensor(actions[indices]),
-            th.tensor(values[indices]),
-            th.tensor(log_probs[indices]),
-            th.tensor(advantages[indices]),
-            th.tensor(returns[indices]),
-            th.tensor(context_error[indices])
+            observations[indices],
+            actions[indices],
+            values[indices],
+            log_probs[indices],
+            advantages[indices],
+            returns[indices],
+            context_error[indices]
         )
-        return RolloutBufferSamples(*tuple(map(th.tensor, data)))
+        return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 
     def get(self, batch_size: Optional[int] = None) -> Generator[TrajectoryBufferSamples, None, None]:
         assert self.full, ""
@@ -581,14 +583,12 @@ class TrajRolloutBuffer():
 
         start_idx = 0
         while start_idx < self.num_trajectories:
-            # for i in indices[start_idx : start_idx + batch_size]:
-            #     # print("gathering batch of trajectory lengths: ", list(self.trajectories[i].buffer_size for i in indices[start_idx:start_idx+batch_size]))
-            #     print()
             yield [self.trajectories[i] for i in indices[start_idx : start_idx + batch_size]]
             start_idx += batch_size
 
     def compute_returns_and_advantage(self, last_value: Dict[int, th.Tensor]) -> None:
         done = set([])
+        # assert last_value.keys() == self.live_agents.keys(), "last value keys were " + str(last_value.keys()) + " but live agents were " + str(self.live_agents.keys())
         for agent_id, unique_id in self.live_agents.items():
             self.trajectories[unique_id].compute_returns_and_advantage(last_value=last_value[agent_id])
             done.add(unique_id)

@@ -55,7 +55,6 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Callable],
-        n_steps: int,
         gamma: float,
         gae_lambda: float,
         ent_coef: float,
@@ -71,6 +70,8 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        rollout_buffer = RolloutBuffer,
+        **kwargs
     ):
 
         super(BaseOnPolicyAlgorithm, self).__init__(
@@ -89,13 +90,16 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             tensorboard_log=tensorboard_log,
         )
 
-        self.n_steps = n_steps
+        # self.n_steps = n_steps
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
-        self.rollout_buffer = None
+        self.rollout_buffer = rollout_buffer
+
+        self.n_rollout_steps = kwargs.get('n_trajectories', kwargs['n_steps'])
+        self.use_context = kwargs.get('use_context')
 
         if _init_setup_model:
             self._setup_model()
@@ -104,14 +108,13 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        self.rollout_buffer = TrajRolloutBuffer(
-            # self.n_steps,
+        self.rollout_buffer = self.rollout_buffer(
+            self.n_rollout_steps,
             self.observation_space,
             self.action_space,
             self.device,
             gae_lambda=self.gae_lambda,
-            gamma=self.gamma,
-            num_trajectories=30 # TODO: need to make more easily configurable
+            gamma=self.gamma
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -168,8 +171,8 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         callback.on_training_start(locals(), globals())
 
         while self.num_timesteps < total_timesteps:
-
-            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+            
+            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_rollout_steps)
 
             if continue_training is False:
                 break
@@ -308,7 +311,7 @@ class OnPolicyAlgorithm(BaseOnPolicyAlgorithm):
 
         return True
 
-class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
+class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
     """
     
     The base for using context based On-Policy algorithms. Handles contexts
@@ -379,9 +382,9 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
         *args,
         **kwargs
     ):
-        print(kwargs)
-        super(ContextOnPolicyAlgorithm, self).__init__(*args, **kwargs)
-
+        self.n_trajectories = kwargs['n_trajectories']
+        kwargs['n_steps'] = self.n_trajectories
+        super(TrajectoryOnPolicyAlgorithm, self).__init__(*args, **kwargs)
 
     def collect_rollouts(
         self, env: VecEnv, callback: BaseCallback, rollout_buffer: TrajRolloutBuffer, n_rollout_steps: int
@@ -445,36 +448,33 @@ class ContextOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
             
-            # TODO: need to fix in the case of new number of agents, since range(len(last_obs)) will be incorrect
-
-            # this adds the last obs, current act, and current reward
-            # so what happens if an agent dies right now?
-                # it will append the previous obs, with current action and the reward from the death. This is good!
-                # that means we should delete the newest obs, delete the newest dones.
             for agent_id, obs_val in self._last_obs.items():
                 rollout_buffer.add(agent_id=agent_id,
-                                context=obs_val[0:self.env.obs_size], # TODO, this needs to be cntx size not obs
+                                context=None, # TODO, this needs to be cntx size not obs
                                 done=self._last_dones[agent_id],
                                 obs=obs_val, # TODO: fix how we pass contexts, obs
                                 action=dict_actions[agent_id],
                                 reward=rewards[agent_id],
                                 value=dict_values[agent_id],
                                 log_prob=dict_log_probs[agent_id])
-            if np.sum(dones[-1]) == 1:
+            
+            if dones["__all__"]:
                 new_obs = env.reset()
                 for agent_id, done in dones.items():
                     rollout_buffer.sig_kill(agent_id)
-                dones = {i:np.array([0]) for i in new_obs.keys()}
+                dones = {i : False for i in new_obs.keys()} # reset the dones for the new environment
             else:
                 for agent_id, done in dones.items():
-                    if agent_id >= 0 and np.sum(done) == 1:
+                    if done:
                         del new_obs[agent_id] # we do this so the policy does not produce an action even after the agent has died
-                        # rollout_buffer.sig_kill(agent_id)
-                        dones[agent_id] = 0
+                        dones[agent_id] = True
+                        # no need to do anything with dones[agent_id], it will just be ignored
+                        rollout_buffer.sig_kill(agent_id)
+                        # del dict_values[agent_id]
             self._last_obs = new_obs
             self._last_dones = dones
 
-        rollout_buffer.compute_returns_and_advantage(values)
+        rollout_buffer.compute_returns_and_advantage(dict_values)
 
         callback.on_rollout_end()
 
