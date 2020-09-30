@@ -15,6 +15,7 @@ from stable_baselines3.common.utils import safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
 from abc import ABC, abstractmethod
+from stable_baselines3.common.decider import Decider
 
 
 class BaseOnPolicyAlgorithm(BaseAlgorithm):
@@ -100,6 +101,7 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
 
         self.n_rollout_steps = kwargs.get('n_trajectories', kwargs['n_steps'])
         self.use_context = kwargs.get('use_context')
+        self.context_size = kwargs.get('context_size')
 
         if _init_setup_model:
             self._setup_model()
@@ -126,6 +128,13 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
+
+        if self.use_context:
+            self.decider : Decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
+            self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
+        else:
+            self.decider = None
+            self.decder_opt = None
 
     @abstractmethod
     def collect_rollouts(
@@ -439,7 +448,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             if callback.on_step() is False:
                 return False
 
-            self._update_info_buffer(infos)
+            # self._update_info_buffer(infos) # Remove use of info buffer for now
             n_steps += 1
             # self.num_timesteps += env.num_envs
             self.num_timesteps += 1
@@ -450,7 +459,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             
             for agent_id, obs_val in self._last_obs.items():
                 rollout_buffer.add(agent_id=agent_id,
-                                context=None, # TODO, this needs to be cntx size not obs
+                                context=infos.get(agent_id, None), # the context if there, or None
                                 done=self._last_dones[agent_id],
                                 obs=obs_val, # TODO: fix how we pass contexts, obs
                                 action=dict_actions[agent_id],
