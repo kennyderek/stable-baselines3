@@ -483,7 +483,7 @@ class TrajRolloutBuffer():
         self.live_agents : Dict[int, int] = {} # env agent-id -> buffer-unique
         self.trajectories : Dict[int, TrajectoryBufferSamples] = {} # buffer-unique id -> trajectory
         self.num_done_trajectories = 0
-        self.use_context = False
+        self.use_context = use_context
 
     def size(self) -> int:
         """
@@ -556,14 +556,17 @@ class TrajRolloutBuffer():
         advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
         if self.use_context:
             context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
+            contexts = np.concatenate([np.broadcast_to(t.context, shape=(t.buffer_size,) + t.context.shape) for t in trajectories])
         else:
             context_error = np.zeros(values.shape)
+            contexts = np.zeros(values.shape)
         
         indices = np.arange(actions.shape[0])
         np.random.shuffle(indices)
 
         data = (
             observations[indices],
+            contexts[indices],
             actions[indices],
             values[indices],
             log_probs[indices],
@@ -586,11 +589,11 @@ class TrajRolloutBuffer():
             yield [self.trajectories[i] for i in indices[start_idx : start_idx + batch_size]]
             start_idx += batch_size
 
-    def compute_returns_and_advantage(self, last_value: Dict[int, th.Tensor]) -> None:
+    def compute_returns_and_advantage(self, last_value: Dict[int, th.Tensor] = {}) -> None:
         done = set([])
         # assert last_value.keys() == self.live_agents.keys(), "last value keys were " + str(last_value.keys()) + " but live agents were " + str(self.live_agents.keys())
         for agent_id, unique_id in self.live_agents.items():
-            self.trajectories[unique_id].compute_returns_and_advantage(last_value=last_value[agent_id])
+            self.trajectories[unique_id].compute_returns_and_advantage(last_value=last_value.get(agent_id, None))
             done.add(unique_id)
         
         for unique_id, buffer in self.trajectories.items():
@@ -609,6 +612,6 @@ class TrajRolloutBuffer():
         :return: (th.Tensor)
         """
         if copy:
-            return th.tensor(array).to(self.device)
-        return th.as_tensor(array).to(self.device)
+            return th.tensor(array, dtype=th.float32).to(self.device)
+        return th.as_tensor(array, dtype=th.float32).to(self.device)
 

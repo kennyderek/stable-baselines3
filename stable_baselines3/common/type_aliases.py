@@ -19,6 +19,7 @@ MaybeCallback = Union[None, Callable, List[BaseCallback], BaseCallback]
 
 class RolloutBufferSamples(NamedTuple):
     observations: th.Tensor
+    contexts: th.Tensor
     actions: th.Tensor
     old_values: th.Tensor
     old_log_prob: th.Tensor

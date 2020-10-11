@@ -199,7 +199,7 @@ class BasePolicy(BaseModel):
                 module.bias.data.fill_(0.0)
 
     @abstractmethod
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+    def _predict(self, observation: th.Tensor, context: th.Tensor, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
 
@@ -214,6 +214,7 @@ class BasePolicy(BaseModel):
     def predict(
         self,
         observation: np.ndarray,
+        context: np.ndarray,
         state: Optional[np.ndarray] = None,
         mask: Optional[np.ndarray] = None,
         deterministic: bool = False,
@@ -253,8 +254,12 @@ class BasePolicy(BaseModel):
         vectorized_env = is_vectorized_observation(observation, self.observation_space)
 
         observation = th.as_tensor(observation).to(self.device)
+        if self.context_size != 0:
+            context = th.as_tensor(context, dtype=th.float32).to(self.device)
+        else:
+            context = None
         with th.no_grad():
-            actions = self._predict(observation, deterministic=deterministic)
+            actions = self._predict(observation, context, deterministic=deterministic)
         # Convert to numpy
         actions = actions.cpu().numpy()
 
@@ -349,6 +354,7 @@ class ActorCriticPolicy(BasePolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        context_size = 0,
     ):
 
         if optimizer_kwargs is None:
@@ -380,6 +386,7 @@ class ActorCriticPolicy(BasePolicy):
 
         self.features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
         self.features_dim = self.features_extractor.features_dim
+        self.context_size = context_size
 
         self.normalize_images = normalize_images
         self.log_std_init = log_std_init
@@ -447,7 +454,7 @@ class ActorCriticPolicy(BasePolicy):
         # Note: If net_arch is None and some features extractor is used,
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = MlpExtractor(self.features_dim, net_arch=self.net_arch, activation_fn=self.activation_fn)
+        self.mlp_extractor = MlpExtractor(self.features_dim + self.context_size, net_arch=self.net_arch, activation_fn=self.activation_fn)
 
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
 
@@ -495,7 +502,7 @@ class ActorCriticPolicy(BasePolicy):
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
-    def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward(self, obs: th.Tensor, ctx: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -503,7 +510,7 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to sample or use deterministic actions
         :return: (Tuple[th.Tensor, th.Tensor, th.Tensor]) action, value and log probability of the action
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
@@ -511,7 +518,7 @@ class ActorCriticPolicy(BasePolicy):
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob
 
-    def _get_latent(self, obs: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def _get_latent(self, obs: th.Tensor, ctx: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Get the latent code (i.e., activations of the last layer of each network)
         for the different networks.
@@ -520,8 +527,10 @@ class ActorCriticPolicy(BasePolicy):
         :return: (Tuple[th.Tensor, th.Tensor, th.Tensor]) Latent codes
             for the actor, the value function and for gSDE function
         """
-        # Preprocess the observation if needed
+        # Preprocess het observation if needed
         features = self.extract_features(obs)
+        if self.context_size != 0:
+            features = th.cat([features, ctx], 1)
         latent_pi, latent_vf = self.mlp_extractor(features)
 
         # Features for sde
@@ -556,7 +565,7 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise ValueError("Invalid action distribution")
 
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+    def _predict(self, observation: th.Tensor, context: th.Tensor, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
 
@@ -564,11 +573,11 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to use stochastic or deterministic actions
         :return: (th.Tensor) Taken action according to the policy
         """
-        latent_pi, _, latent_sde = self._get_latent(observation)
+        latent_pi, _, latent_sde = self._get_latent(observation, context)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         return distribution.get_actions(deterministic=deterministic)
 
-    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def evaluate_actions(self, obs: th.Tensor, ctx: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -578,7 +587,7 @@ class ActorCriticPolicy(BasePolicy):
         :return: (th.Tensor, th.Tensor, th.Tensor) estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
@@ -638,6 +647,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        context_size = 0,
     ):
         super(ActorCriticCnnPolicy, self).__init__(
             observation_space,
@@ -657,6 +667,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            context_size
         )
 
 

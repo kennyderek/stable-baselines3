@@ -154,7 +154,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         for idx, t in enumerate(trajectory_batch):
             with th.no_grad():
                 features = self.policy.features_extractor(th.as_tensor(t.observations[0:t.buffer_size:self.sample_frequency], dtype=th.float).to(self.device))
-            trajectories[idx][0:((t.buffer_size - 1)//self.sample_frequency)+1] = features
+            trajectories[idx][0:((t.buffer_size - 1)//self.sample_frequency)+1] = features.cpu()
             lengths[idx] = t.buffer_size//self.sample_frequency
             targets[idx] = t.context
         return trajectories, targets, lengths # (B, N, Obs), # (B, Cnxt), # (B,)
@@ -176,24 +176,31 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         pg_losses, value_losses, decider_losses = [], [], []
         clip_fractions = []
 
+        if self.use_context:
+            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+                trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
+                t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
+                t_packed = t_packed.to(self.device)
+                with th.no_grad():
+                    context_predictions = self.decider(t_packed) # (batch, context_size)
+                context_mse = np.sum(np.square(context_targets - context_predictions.cpu().detach().numpy()), axis=-1)
+                context_mse = np.log10(context_mse + 1) # rescale so rewards look even
+                # print(context_mse)
+                for idx, t in enumerate(trajectory_batch):
+                    blank = np.zeros(t.rewards.shape)
+                    blank[-1] = context_mse[idx]
+                    t.context_error = blank
+                t.rewards = -t.context_error # penalizes a high context error, and it's minimum is 0
+                # print(t.rewards)
+        self.rollout_buffer.compute_returns_and_advantage()
+
         # train for gradient_steps epochs
         num_steps_in_epoch = 0
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                if self.use_context:
-                    trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
-                    t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
-                    t_packed = t_packed.to(self.device)
-                    with th.no_grad():
-                        context_predictions = self.decider(t_packed) # (batch, context_size)
-                    context_mse = np.sum(np.square(context_targets - context_predictions.cpu().detach().numpy()), axis=-1)
-                    context_mse_normalized = (context_mse - context_mse.mean()) / (context_mse.std() + 1e-8)
-                    context_mse_normalized = context_mse_normalized.reshape((len(trajectory_batch), 1))
-                    for idx, t in enumerate(trajectory_batch):
-                        t.context_error = np.broadcast_to(context_mse_normalized[idx], shape=(t.buffer_size,))
-                
+
                 rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
                 num_steps_in_epoch += rollout_data.actions.shape[0]
 
@@ -208,13 +215,13 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions) # TODO, return features HERE
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, rollout_data.contexts, actions) # TODO, return features HERE
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                if self.use_context:
-                    advantages -= rollout_data.context_error # TODO, change to log, evaluate whether this is correct?
+                # if self.use_context:
+                #     advantages -= rollout_data.context_error # TODO, change to log, evaluate whether this is correct?
 
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
@@ -267,19 +274,19 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 print(f"Early stopping at step {epoch} due to reaching max kl: {np.mean(approx_kl_divs):.2f}")
                 break
 
-            if self.use_context:
-                # Decider update
-                for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                    # here, do the Decider pass on each trajectory, and modify trajectory advantage
-                    trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
-                    t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
-                    t_packed = t_packed.to(self.device)
-                    context_predictions = self.decider(t_packed) # (batch, context_size)
-                    loss = F.mse_loss(context_predictions, th.tensor(context_targets).to(self.device))
-                    decider_losses.append(loss.item())
-                    self.decider_opt.zero_grad()
-                    loss.backward()
-                    self.decider_opt.step()
+        if self.use_context:
+            # Decider update
+            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+                # here, do the Decider pass on each trajectory, and modify trajectory advantage
+                trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
+                t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
+                t_packed = t_packed.to(self.device)
+                context_predictions = self.decider(t_packed) # (batch, context_size)
+                loss = F.mse_loss(context_predictions, th.tensor(context_targets).to(self.device))
+                decider_losses.append(loss.item())
+                self.decider_opt.zero_grad()
+                loss.backward()
+                self.decider_opt.step()
 
         self._n_updates += self.n_epochs
         # explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())

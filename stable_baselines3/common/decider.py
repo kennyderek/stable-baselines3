@@ -22,3 +22,28 @@ class Decider(nn.Module):
         logits = self.fc1(unpacked[-1].double()) # (batch, output_size)
         return logits
 
+class FCNDecider(nn.Module):
+
+    def __init__(self, input_size, output_size):
+        super(FCNDecider, self).__init__()
+
+        self.batch_size = 10 # 10 trajectories
+        self.fc = nn.Sequential(
+            nn.Linear(input_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, output_size)
+        ).double()
+
+    def forward(self, sequence):
+        '''
+        squence: (batch, input_size)
+        return: batch, output_size
+        '''
+
+        # output, hiddens = self.rnn(sequence) # returns a packed_padded_sequence
+        # unpacked, unpacked_len = nn.utils.rnn.pad_packed_sequence(output) # (seq_len, batch, num_directions * hidden_size), (h_n, c_n)
+        # logits = self.fc1(unpacked[-1].double()) # (batch, output_size)
+        logits = self.fc(sequence)
+        return logits

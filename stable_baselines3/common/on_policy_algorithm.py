@@ -15,7 +15,7 @@ from stable_baselines3.common.utils import safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
 from abc import ABC, abstractmethod
-from stable_baselines3.common.decider import Decider
+from stable_baselines3.common.decider import Decider, FCNDecider
 
 
 class BaseOnPolicyAlgorithm(BaseAlgorithm):
@@ -100,8 +100,8 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         self.rollout_buffer = rollout_buffer
 
         self.n_rollout_steps = kwargs.get('n_trajectories', kwargs['n_steps'])
-        self.use_context = kwargs.get('use_context')
-        self.context_size = kwargs.get('context_size')
+        self.use_context = kwargs.get('use_context', False)
+        self.context_size = kwargs.get('context_size', 0)
 
         if _init_setup_model:
             self._setup_model()
@@ -116,7 +116,8 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.action_space,
             self.device,
             gae_lambda=self.gae_lambda,
-            gamma=self.gamma
+            gamma=self.gamma,
+            use_context=self.use_context
             # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
@@ -125,12 +126,16 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             self.lr_schedule,
             use_sde=self.use_sde,
             # device=self.device,
+            context_size=self.context_size,
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
 
         if self.use_context:
-            self.decider : Decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
+            flattened_obs_shape = self.observation_space.sample().flatten().shape[0]
+            # self.policy.features_dim
+            self.decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
+            # self.decider = FCNDecider(self.policy.features_dim*2, self.context_size).to(self.device)
             self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
         else:
             self.decider = None
@@ -314,7 +319,7 @@ class OnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             self._last_obs = new_obs
             self._last_dones = dones
 
-        rollout_buffer.compute_returns_and_advantage(values, dones=dones)
+        # rollout_buffer.compute_returns_and_advantage(values, dones=dones)
 
         callback.on_rollout_end()
 
@@ -424,12 +429,17 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
+            contexts = self._last_obs.pop("__contexts__")
             key_list = list(self._last_obs.keys()) # keep this to map from dictionaries of actions/obs to contiguous arrays
 
             with th.no_grad():
                 # Convert to pytorch tensor
-                obs_ctx_tensor = th.as_tensor(self.dict_obs_to_array(self._last_obs, key_list)).to(self.device)
-                actions, values, log_probs = self.policy.forward(obs_ctx_tensor)
+                obs_tensor = th.as_tensor(self.dict_obs_to_array(self._last_obs, key_list)).to(self.device)
+                if self.use_context:
+                    ctx_tensor = th.as_tensor(self.dict_obs_to_array(contexts, key_list), dtype=th.float32).to(self.device)
+                else:
+                    ctx_tensor = None
+                actions, values, log_probs = self.policy.forward(obs_tensor, ctx_tensor)
             actions = actions.cpu().numpy()
             dict_actions = self.array_to_dict_actions(actions, key_list)
             dict_values = self.array_to_dict_actions(values, key_list)
@@ -459,7 +469,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             
             for agent_id, obs_val in self._last_obs.items():
                 rollout_buffer.add(agent_id=agent_id,
-                                context=infos.get(agent_id, None), # the context if there, or None
+                                context=contexts.get(agent_id, None), # the context if there, or None
                                 done=self._last_dones[agent_id],
                                 obs=obs_val, # TODO: fix how we pass contexts, obs
                                 action=dict_actions[agent_id],
