@@ -134,8 +134,9 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         if self.use_context:
             flattened_obs_shape = self.observation_space.sample().flatten().shape[0]
             # self.policy.features_dim
-            self.decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
-            # self.decider = FCNDecider(self.policy.features_dim*2, self.context_size).to(self.device)
+            print("SHAAAAPE", flattened_obs_shape)
+            # self.decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
+            self.decider = FCNDecider(self.policy.features_dim*2, self.context_size).to(self.device)
             self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
         else:
             self.decider = None
@@ -429,7 +430,10 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
-            contexts = self._last_obs.pop("__contexts__")
+            if self.use_context:
+                contexts = self._last_obs.pop("__contexts__")
+            else:
+                contexts = {}
             key_list = list(self._last_obs.keys()) # keep this to map from dictionaries of actions/obs to contiguous arrays
 
             with th.no_grad():
@@ -470,7 +474,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             for agent_id, obs_val in self._last_obs.items():
                 rollout_buffer.add(agent_id=agent_id,
                                 context=contexts.get(agent_id, None), # the context if there, or None
-                                done=self._last_dones[agent_id],
+                                done=self._last_dones.get(agent_id, 0),
                                 obs=obs_val, # TODO: fix how we pass contexts, obs
                                 action=dict_actions[agent_id],
                                 reward=rewards[agent_id],
