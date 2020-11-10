@@ -102,6 +102,9 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         self.n_rollout_steps = kwargs.get('n_trajectories', kwargs['n_steps'])
         self.use_context = kwargs.get('use_context', False)
         self.context_size = kwargs.get('context_size', 0)
+        self.decoder_method = kwargs.get('decoder_method', 'none')
+        self.use_decoder = kwargs.get('use_decoder', False)
+        self.use_exploration_kl = kwargs.get('use_exploration_kl', False)
 
         if _init_setup_model:
             self._setup_model()
@@ -118,7 +121,6 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             gae_lambda=self.gae_lambda,
             gamma=self.gamma,
             use_context=self.use_context
-            # n_envs=self.n_envs
         )
         self.policy = self.policy_class(
             self.observation_space,
@@ -131,12 +133,16 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
-        if self.use_context:
+        if self.use_context and self.use_decoder:
             flattened_obs_shape = self.observation_space.sample().flatten().shape[0]
             # self.policy.features_dim
-            print("SHAAAAPE", flattened_obs_shape)
-            # self.decider = Decider(self.policy.features_dim, self.context_size).to(self.device)
-            self.decider = FCNDecider(self.policy.features_dim*2, self.context_size).to(self.device)
+            print("shape of obs:", flattened_obs_shape)
+            if self.decoder_method == 'valor':
+                self.decider = Decider(flattened_obs_shape, self.context_size).to(self.device, dtype=th.float)
+            elif self.decoder_method == 'diayn':
+                self.decider = FCNDecider(flattened_obs_shape*2, self.context_size).to(self.device, dtype=th.float)
+            elif self.decoder_method == 'state':
+                self.decider = FCNDecider(flattened_obs_shape, self.context_size).to(self.device, dtype=th.float)
             self.decider_opt = th.optim.Adam(self.decider.parameters(), lr=3e-4)
         else:
             self.decider = None

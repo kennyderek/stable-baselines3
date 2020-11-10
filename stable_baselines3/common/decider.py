@@ -7,8 +7,8 @@ class Decider(nn.Module):
         super(Decider, self).__init__()
 
         self.batch_size = 10 # 10 trajectories
-        self.rnn = nn.LSTM(input_size=input_size, hidden_size=64).double()
-        self.fc1 = nn.Linear(64, output_size).double() # output_size is size of the context
+        self.rnn = nn.LSTM(input_size=input_size, hidden_size=64)
+        self.fc1 = nn.Linear(64, output_size) # output_size is size of the context
     
     def forward(self, sequence):
         '''
@@ -19,7 +19,7 @@ class Decider(nn.Module):
 
         output, hiddens = self.rnn(sequence) # returns a packed_padded_sequence
         unpacked, unpacked_len = nn.utils.rnn.pad_packed_sequence(output) # (seq_len, batch, num_directions * hidden_size), (h_n, c_n)
-        logits = self.fc1(unpacked[-1].double()) # (batch, output_size)
+        logits = self.fc1(unpacked[-1]) # (batch, output_size)
         return logits
 
 class FCNDecider(nn.Module):
@@ -29,12 +29,12 @@ class FCNDecider(nn.Module):
 
         self.batch_size = 10 # 10 trajectories
         self.fc = nn.Sequential(
-            nn.Linear(input_size, 256),
+            nn.Linear(input_size, 64),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(256, output_size)
-        ).double()
+            nn.Linear(64, output_size)
+        )
 
     def forward(self, sequence):
         '''

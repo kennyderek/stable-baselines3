@@ -115,7 +115,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         _init_setup_model: bool = True,
         rollout_buffer = TrajRolloutBuffer,
         use_context=False,
-        context_size=None
+        context_size=None,
+        use_decoder=False,
+        use_exploration_kl=False,
+        decoder_method='diayn'
     ):
 
         super(PPO, self).__init__(
@@ -139,7 +142,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
             _init_setup_model=False,
             rollout_buffer=rollout_buffer,
             use_context = use_context,
-            context_size = context_size
+            context_size = context_size,
+            use_decoder=use_decoder,
+            use_exploration_kl=use_exploration_kl,
+            decoder_method=decoder_method
         )
 
         self.batch_size = batch_size
@@ -166,25 +172,83 @@ class PPO(TrajectoryOnPolicyAlgorithm):
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
 
-    def _get_decider_batches(self, trajectory_batch: List[TrajectoryBufferSamples]):
-        self.decision_length = None
-        self.sample_frequency = 4 # TODO: hardcoded
-        # observation_shape = trajectory_batch[0].observations.shape[1:] # excludes the length N of the trajectory
+    def _get_decider_batches_valor(self, trajectory_batch: List[TrajectoryBufferSamples]):
+        decision_length = None
+        sample_frequency = 2 # TODO: hardcoded
+        observation_shape = trajectory_batch[0].observations.shape[1:] # excludes the length N of the trajectory
         max_trajectory_length = max(t.buffer_size for t in trajectory_batch)
-        final_length = (max_trajectory_length if self.decision_length == None else self.decision_length)//self.sample_frequency + 1
+        final_length = (max_trajectory_length if decision_length == None else decision_length)//sample_frequency + 1
         num_trajectories = len(trajectory_batch) # TODO: modify to match decison length
         
         lengths = np.zeros((num_trajectories,))
-        trajectories = np.zeros((num_trajectories, final_length,) + (int(self.policy.features_dim/2),)) # (B, N, Obs)
+        trajectories = np.zeros((num_trajectories, final_length,) + observation_shape) # (B, N, Obs)
         targets = np.zeros((num_trajectories, self.env.context_size))
         for idx, t in enumerate(trajectory_batch):
-            with th.no_grad():
-                features = self.policy.features_extractor(th.as_tensor(t.observations[0:t.buffer_size:self.sample_frequency], dtype=th.float).to(self.device))
-            print("feaaaaut", features.shape)
-            trajectories[idx][0:((t.buffer_size - 1)//self.sample_frequency)+1] = features.cpu()
-            lengths[idx] = t.buffer_size//self.sample_frequency
+            features = th.as_tensor(t.observations[0:t.buffer_size:sample_frequency]).to(self.device, dtype=th.float)
+            trajectories[idx][0:((t.buffer_size - 1)//sample_frequency)+1] = features
+            lengths[idx] = t.buffer_size//sample_frequency
             targets[idx] = t.context
-        return trajectories, targets, lengths # (B, N, Obs), # (B, Cnxt), # (B,)
+        t_packed = pack_padded_sequence(th.tensor(trajectories).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
+        t_packed = t_packed.to(self.device, dtype=th.float)
+        return t_packed, targets, lengths # (B, N, Obs), # (B, Cnxt), # (B,)
+
+    def _get_decider_batches_diayn(self, trajectory_batch):
+        skip_frequency = 1 # TODO parameter tuning
+        observation_shape = trajectory_batch[0].observations.shape[1:] # excludes the length N of the trajectory
+        obs_len = observation_shape[0]
+        total_states = sum([t.buffer_size for t in trajectory_batch])
+        states = np.zeros((total_states,) + (obs_len*2,) + observation_shape[1:]) # we make room for the current, and next observation
+        ctx_targets = np.zeros((total_states, self.env.context_size))
+        current_idx = 0
+        for idx, t in enumerate(trajectory_batch):
+            states[current_idx:current_idx+t.buffer_size,0:obs_len] = t.observations
+            states[current_idx:current_idx+t.buffer_size-1, obs_len:] = t.observations[1:]
+            ctx_targets[current_idx:current_idx+t.buffer_size] = np.broadcast_to(t.context, (t.buffer_size,) + t.context.shape)
+            current_idx += t.buffer_size
+        states = th.tensor(states).to(self.device, dtype=th.float)
+        return states, ctx_targets, None
+
+    def _get_decider_batches_state_based(self, trajectory_batch: List[TrajectoryBufferSamples]):
+        observation_shape = trajectory_batch[0].observations.shape[1:] # excludes the length N of the trajectory
+        total_states = sum([t.buffer_size for t in trajectory_batch])
+        states = np.zeros((total_states,) + observation_shape)
+        ctx_targets = np.zeros((total_states, self.env.context_size))
+        current_idx = 0
+        for idx, t in enumerate(trajectory_batch):
+            states[current_idx:current_idx+t.buffer_size] = t.observations
+            ctx_targets[current_idx:current_idx+t.buffer_size] = np.broadcast_to(t.context, (t.buffer_size,) + t.context.shape)
+            current_idx += t.buffer_size
+        states = th.tensor(states).to(self.device, dtype=th.float)
+        return states, ctx_targets, None
+
+    def _get_context_error(self, trajectory_batch, with_grad = False):
+        d = {'valor': self._get_decider_batches_valor,
+             'state': self._get_decider_batches_state_based,
+             'diayn': self._get_decider_batches_diayn}
+        trajectory_features, context_targets, lengths = d[self.decoder_method](trajectory_batch)
+        if with_grad:
+            context_predictions = self.decider(trajectory_features) # (batch, context_size)
+        else:
+            with th.no_grad():
+                context_predictions = self.decider(trajectory_features) # (batch, context_size)
+        error = F.cross_entropy(context_predictions,
+            th.argmax(th.tensor(context_targets).to(self.device, dtype=th.float), dim=-1),
+            reduce=with_grad)
+        return error
+
+    def _annotate_context_error(self, trajectory_batch):
+        error = self._get_context_error(trajectory_batch, False)
+        
+        if len(trajectory_batch) == error.shape[0]:
+            # then we are using VALOR, and there is 1 error per trajectory
+            for idx, t in enumerate(trajectory_batch):
+                t.context_error = np.broadcast_to(error[idx].numpy(), (t.buffer_size,))
+        else:
+            # then there is 1 error term per obs
+            current_idx=0
+            for idx, t in enumerate(trajectory_batch):
+                t.context_error = error[current_idx:current_idx+t.buffer_size]
+                current_idx += t.buffer_size
 
     def train(self) -> None:
         """
@@ -202,34 +266,19 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         entropy_losses, all_kl_divs = [], []
         pg_losses, value_losses, decider_losses = [], [], []
         clip_fractions = []
-        divs, vvals = [], []
+        exploration_divs = []
         sampler_density, sampler_loss = [], []
 
-        use_decider = True
-        if self.use_context and use_decider:
+        # use_decider = False
+        if self.use_context and self.use_decoder:
             for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
-                t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
-                t_packed = t_packed.to(self.device)
-                with th.no_grad():
-                    context_predictions = self.decider(t_packed) # (batch, context_size)
-                context_mse = np.sum(np.square(context_targets - context_predictions.cpu().detach().numpy()), axis=-1)
-                # context_mse = np.log10(context_mse + 1) # rescale so rewards look even
-                # print(context_mse)
-                for idx, t in enumerate(trajectory_batch):
-                    blank = np.ones(t.rewards.shape) * context_mse[idx]
-                    # blank[-1] = context_mse[idx]
-                    # t.context_error = np.ones(t.rewards.shape)# * context_mse[idx]
-                    t.context_error = blank
-                    # t.rewards = blank
+                self._annotate_context_error(trajectory_batch)
         else:
             for trajectory_batch in self.rollout_buffer.get(self.batch_size):
                 for idx, t in enumerate(trajectory_batch):
                     t.context_error = np.ones(t.rewards.shape)
         
         self.rollout_buffer.compute_returns_and_advantage()
-
-        # calculate average reward
 
         # train for gradient_steps epochs
         num_steps_in_epoch = 0
@@ -257,7 +306,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                if self.use_context and use_decider:
+                if self.use_context and self.use_decoder:
                     advantages -= (rollout_data.context_error - rollout_data.context_error.mean()) / (rollout_data.context_error.std() + 1e-8) # TODO, change to log, evaluate whether this is correct?
 
                 # ratio between old and new policy, should be one at the first iteration
@@ -298,63 +347,19 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
 
                 # define exploration loss
-                expl = False
-                if expl:
-                    # samples = rollout_data.observations[:50]
-                    # # l = []
-                    # # for i in range(-3, 4):
-                    # #     for j in range(-3, 4):
-                    # #         l.append([i, j])
-                    # # samples = th.tensor(np.array(l), dtype=th.float).to(self.device)
-                    # log_p = {}
-                    # for t in trajectory_batch[:5]:
-                    #     # print(t.context)
-                    #     # print(np.broadcast_to(t.context, (samples.shape[0],) + t.context.shape))
-                    #     # print(th.tensor(np.broadcast_to(t.context, (samples.shape[0],) + t.context.shape)))
-                    #     c = th.tensor(copy.deepcopy(np.broadcast_to(t.context, (samples.shape[0],) + t.context.shape)))#.to(self.device)
-                    #     ca = c.to(self.device, dtype=th.float)
-                    #     # print("YAYAYAAY")
-                    #     log_p[tuple(t.context)] = {}
-                    #     for action in range(0, 5):
-                    #         a = th.tensor(np.ones(samples.shape[0]) * action).to(self.device, dtype=th.float)
-                    #         values_c, log_prob_c, _ = self.policy.evaluate_actions(samples, ca, a) # TODO, return features HERE
-                    #         log_p[tuple(t.context)][action] = log_prob_c, values_c
-
-                    # div_loss = 0
-                    # val_loss = 0
-                    # for c in log_p:
-                    #     for o in log_p:
-                    #         if c != o:
-                    #             div = 0
-                    #             vals = 0
-                    #             for a in range(0, 5):
-                    #                 kl = th.exp(log_p[c][a][0]) * (log_p[c][a][0] - log_p[o][a][0])
-                    #                 div += th.clamp(th.mean(kl), 0, 0.1)
-                    #                 vals += ((log_p[c][a][1] - log_p[o][a][1])**2)**(1/2)
-                    #             div_loss += div * np.sum((np.array(c) - np.array(o))**2)**(1/2)
-                    #             val_loss += th.clamp(th.mean(vals), 0, 0.1) * np.sum((np.array(c) - np.array(o))**2)**(1/2)
-                    # div_loss = div_loss/(len(log_p)**2 - len(log_p))
-                    # val_loss = val_loss/(len(log_p)**2 - len(log_p))
-                    # loss -= div_loss
-                    # loss -= val_loss
-                    # divs.append(div_loss.cpu().item())
-                    # vvals.append(val_loss.cpu().item())
-
+                if self.use_exploration_kl:
                     num_context_samples = self.context_size
                     num_obs_samples = 100
                     action_space_size = 5
 
                     samples = rollout_data.observations[:num_obs_samples]
-                    # print(choices)
-
                     contexts_to_use = np.identity(self.context_size)
 
-                    log_p = {}
                     context_samples = []
                     action_samples = []
                     state_samples = []
                     for c in contexts_to_use:
-                        c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + t.context.shape)))#.to(self.device)
+                        c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + (self.context_size,))))#.to(self.device)
                         for action in range(0, action_space_size):
                             a = th.tensor(np.ones(samples.shape[0]) * action)
                             action_samples.append(a)
@@ -363,58 +368,43 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
                     action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
                     state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
-                    div_vals, div_log_probs, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples)
-                    # normalize div_vals
-                    # div_vals = (div_vals - div_vals.mean()) / (div_vals.std() + 1e-8)
-                    div = 0
-                    div_sampler = 0
-                    val_div = 0
+                    _, div_log_probs, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples)
+
+                    kl_policy = 0
+                    kl_sampler = 0
                     s_num = samples.shape[0] * action_space_size # 6 is the number of actions
                     count = 0
 
                     choices = self.sample_chooser.forward(state_samples[0:s_num])
-                    # # print(choices)
-                    # # print(choices[:,:1])
-                    # impt = state_samples[th.argmax(choices)]
-                    # weight = choices[th.argmax(choices)]
-                    # print("most important sample: ", impt, " with weight ", weight)
-                    # print(choices)
 
+                    min_kl_val = 1e8
                     for i in range(0, num_context_samples):
                         p_choices = div_log_probs[i*s_num:(i+1)*s_num]
-                        # p_vals = div_vals[i*s_num:(i+1)*s_num]
                         for j in range(0, num_context_samples):
                             dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)
                             
                             if i != j and dist_btw != 0:
-                                # print(context_samples[i*s_num], context_samples[j*s_num])
                                 count += 1
                                 q_choices = div_log_probs[j*s_num:(j+1)*s_num]
-                                # q_vals = div_vals[j*s_num:(j+1)*s_num]
-                                kl_original = th.exp(p_choices) * (p_choices - q_choices)
 
-                                kl = kl_original * choices.detach()
+                                divs = th.exp(p_choices) * (p_choices - q_choices)
+                                divs_policy = divs * th.flatten(choices).detach() * s_num
+                                divs_sampler = divs.detach() * th.flatten(choices) * s_num
 
-                                kl_sampler = kl_original.detach() * choices#[:,:1]
-
-                                # div += th.clamp(th.mean(kl), 0, 10)# * dist_btw
-                                div += th.clamp(th.sum(kl), 0, 10)
-                                # div_sampler += th.clamp(th.mean(kl_sampler), 0, 10)# * dist_btw
-                                div_sampler += th.clamp(th.sum(kl_sampler), 0, 10)
-                                # val_div += (th.sum(p_vals - q_vals)**2)**(1/2) * dist_btw
-                    average_div = div
-                    # val_loss = val_div / count
-                    loss += -average_div
-                    # loss -= val_loss
-                    divs.append(average_div.cpu().item())
-                    # vvals.append(val_loss.cpu().item())
-
-                    average_div_sampler = div_sampler
+                                temp_kl_policy = th.clamp(th.sum(divs_policy), 0, 200)
+                                if temp_kl_policy.cpu().item() < min_kl_val:
+                                    min_kl_val = temp_kl_policy.cpu().item()
+                                    kl_policy = temp_kl_policy
+                                
+                                kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
+                    
+                    loss += -kl_policy
+                    exploration_divs.append(kl_policy.cpu().item())
 
                     self.sample_optimizer.zero_grad()
-                    # we want to minimize divergence, and minimize target density error
+                    # we want to minimize divergence
                     entropy_of_choices = th.sum(-choices * th.log(choices))
-                    sample_loss = average_div_sampler# + entropy_of_choices# + (0.25 - th.sum(choices[:,:1])/len(choices))**2 # we want NON ENTROPIC choices!!
+                    sample_loss = kl_sampler# + entropy_of_choices# + (0.25 - th.sum(choices[:,:1])/len(choices))**2 # we want NON ENTROPIC choices!!
                     sample_loss.backward(retain_graph=True)
                     self.sample_optimizer.step()
                     sampler_density.append(entropy_of_choices.item())
@@ -434,18 +424,13 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 print(f"Early stopping at step {epoch} due to reaching max kl: {np.mean(approx_kl_divs):.2f}")
                 break
 
-        if self.use_context and use_decider:
+        if self.use_context and self.use_decoder:
             # Decider update
             for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                # here, do the Decider pass on each trajectory, and modify trajectory advantage
-                trajectory_features, context_targets, lengths = self._get_decider_batches(trajectory_batch)
-                t_packed = pack_padded_sequence(th.tensor(trajectory_features).transpose(0, 1), lengths, enforce_sorted=False) # takes (L, B)
-                t_packed = t_packed.to(self.device)
-                context_predictions = self.decider(t_packed) # (batch, context_size)
-                loss = F.mse_loss(context_predictions, th.tensor(context_targets).to(self.device))
-                decider_losses.append(loss.item())
+                decider_loss = self._get_context_error(trajectory_batch, with_grad=True)
+                decider_losses.append(decider_loss.item())
                 self.decider_opt.zero_grad()
-                loss.backward()
+                decider_loss.backward()
                 self.decider_opt.step()
 
         self._n_updates += self.n_epochs
@@ -457,10 +442,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         # logger.record("train/entropy_loss", np.mean(entropy_losses))
         logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         logger.record("train/value_loss", np.mean(value_losses))
-        logger.record("train/div_divergence", np.mean(np.array(divs)))
+        logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
         logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
         logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
-        # logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
+        logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
         # logger.record("train/vval_loss", np.mean(np.array(vvals)))
         # logger.record("train/approx_kl", np.mean(approx_kl_divs))
         # logger.record("train/clip_fraction", np.mean(clip_fraction))
