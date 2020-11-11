@@ -118,7 +118,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         context_size=None,
         use_decoder=False,
         use_exploration_kl=False,
-        decoder_method='diayn'
+        decoder_method='diayn',
+        use_learned_sampler=True
     ):
 
         super(PPO, self).__init__(
@@ -145,7 +146,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
             context_size = context_size,
             use_decoder=use_decoder,
             use_exploration_kl=use_exploration_kl,
-            decoder_method=decoder_method
+            decoder_method=decoder_method,
+            use_learned_sampler=use_learned_sampler
         )
 
         self.batch_size = batch_size
@@ -155,8 +157,9 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         self.target_kl = target_kl
         self.use_context = use_context
 
-        self.sample_chooser = SampleChooser(env.observation_space.sample().flatten().shape[0]).to(self.device)
-        self.sample_optimizer = optim.Adam(self.sample_chooser.parameters(), lr=3e-4)
+        if self.use_learned_sampler:
+            self.sample_chooser = SampleChooser(env.observation_space.sample().flatten().shape[0]).to(self.device)
+            self.sample_optimizer = optim.Adam(self.sample_chooser.parameters(), lr=3e-4)
 
         if _init_setup_model:
             self._setup_model()
@@ -184,7 +187,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         trajectories = np.zeros((num_trajectories, final_length,) + observation_shape) # (B, N, Obs)
         targets = np.zeros((num_trajectories, self.env.context_size))
         for idx, t in enumerate(trajectory_batch):
-            features = th.as_tensor(t.observations[0:t.buffer_size:sample_frequency]).to(self.device, dtype=th.float)
+            features = t.observations[0:t.buffer_size:sample_frequency]
             trajectories[idx][0:((t.buffer_size - 1)//sample_frequency)+1] = features
             lengths[idx] = t.buffer_size//sample_frequency
             targets[idx] = t.context
@@ -237,7 +240,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         return error
 
     def _annotate_context_error(self, trajectory_batch):
-        error = self._get_context_error(trajectory_batch, False)
+        error = self._get_context_error(trajectory_batch, False).cpu()
         
         if len(trajectory_batch) == error.shape[0]:
             # then we are using VALOR, and there is 1 error per trajectory
@@ -375,7 +378,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     s_num = samples.shape[0] * action_space_size # 6 is the number of actions
                     count = 0
 
-                    choices = self.sample_chooser.forward(state_samples[0:s_num])
+                    if self.use_learned_sampler:
+                        choices = self.sample_chooser.forward(state_samples[0:s_num])
 
                     min_kl_val = 1e8
                     for i in range(0, num_context_samples):
@@ -388,27 +392,32 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 q_choices = div_log_probs[j*s_num:(j+1)*s_num]
 
                                 divs = th.exp(p_choices) * (p_choices - q_choices)
-                                divs_policy = divs * th.flatten(choices).detach() * s_num
-                                divs_sampler = divs.detach() * th.flatten(choices) * s_num
+                                if self.use_learned_sampler:
+                                    divs_policy = divs * th.flatten(choices).detach() * s_num
+                                    divs_sampler = divs.detach() * th.flatten(choices) * s_num
+                                else:
+                                    divs_policy = divs
 
                                 temp_kl_policy = th.clamp(th.sum(divs_policy), 0, 200)
                                 if temp_kl_policy.cpu().item() < min_kl_val:
                                     min_kl_val = temp_kl_policy.cpu().item()
                                     kl_policy = temp_kl_policy
                                 
-                                kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
+                                if self.use_learned_sampler:
+                                    kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
                     
                     loss += -kl_policy
                     exploration_divs.append(kl_policy.cpu().item())
 
-                    self.sample_optimizer.zero_grad()
-                    # we want to minimize divergence
-                    entropy_of_choices = th.sum(-choices * th.log(choices))
-                    sample_loss = kl_sampler# + entropy_of_choices# + (0.25 - th.sum(choices[:,:1])/len(choices))**2 # we want NON ENTROPIC choices!!
-                    sample_loss.backward(retain_graph=True)
-                    self.sample_optimizer.step()
-                    sampler_density.append(entropy_of_choices.item())
-                    sampler_loss.append(sample_loss.cpu().item())
+                    if self.use_learned_sampler:
+                        self.sample_optimizer.zero_grad()
+                        # we want to minimize divergence
+                        entropy_of_choices = th.sum(-choices * th.log(choices))
+                        sample_loss = kl_sampler# + entropy_of_choices# + (0.25 - th.sum(choices[:,:1])/len(choices))**2 # we want NON ENTROPIC choices!!
+                        sample_loss.backward(retain_graph=True)
+                        self.sample_optimizer.step()
+                        sampler_density.append(entropy_of_choices.item())
+                        sampler_loss.append(sample_loss.cpu().item())
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
@@ -437,27 +446,34 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         # explained_var = explained_variance(self.rollout_buffer.returns.flatten(), self.rollout_buffer.values.flatten())
 
         # Logs
-        logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
-        # logger.record("train/avg_rew", rew/avg_rew)
-        # logger.record("train/entropy_loss", np.mean(entropy_losses))
-        logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        logger.record("train/value_loss", np.mean(value_losses))
-        logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
-        logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
-        logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
-        logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
-        # logger.record("train/vval_loss", np.mean(np.array(vvals)))
-        # logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        # logger.record("train/clip_fraction", np.mean(clip_fraction))
-        logger.record("train/loss", loss.item())
-        # logger.record("train/explained_variance", explained_var)
-        if hasattr(self.policy, "log_std"):
-            logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        if True:   
+            logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
+            # logger.record("train/avg_rew", rew/avg_rew)
+            # logger.record("train/entropy_loss", np.mean(entropy_losses))
+            logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+            logger.record("train/value_loss", np.mean(value_losses))
+            logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
+            logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
+            logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
+            logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
+            # logger.record("train/vval_loss", np.mean(np.array(vvals)))
+            # logger.record("train/approx_kl", np.mean(approx_kl_divs))
+            # logger.record("train/clip_fraction", np.mean(clip_fraction))
+            logger.record("train/loss", loss.item())
+            # logger.record("train/explained_variance", explained_var)
+            if hasattr(self.policy, "log_std"):
+                logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
-        logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        logger.record("train/clip_range", clip_range)
-        if self.clip_range_vf is not None:
-            logger.record("train/clip_range_vf", clip_range_vf)
+            logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            logger.record("train/clip_range", clip_range)
+            if self.clip_range_vf is not None:
+                logger.record("train/clip_range_vf", clip_range_vf)
+        else:
+            print({"eps_len": num_steps_in_epoch/(self.n_epochs * self.n_trajectories),
+                    "sampler_entropy": np.mean(np.array(sampler_density)),
+                    "sampler_loss": np.mean(np.array(sampler_loss)),
+                    "decider_loss": np.mean(np.array(decider_losses)),
+                    "n_updates": self._n_updates})
 
     def learn(
         self,

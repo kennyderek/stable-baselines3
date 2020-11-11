@@ -141,13 +141,13 @@ class HumanOutputFormat(KVWriter, SeqWriter):
 
 
 class JSONOutputFormat(KVWriter):
-    def __init__(self, filename: str):
+    def __init__(self, filename: str = ""):
         """
         log to a file, in the JSON format
 
         :param filename: (str) the file to write the log to
         """
-        self.file = open(filename, "wt")
+        # self.file = open(filename, "wt")
 
     def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
         for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items())):
@@ -162,8 +162,9 @@ class JSONOutputFormat(KVWriter):
                 else:
                     # otherwise, a value is a numpy array, serialize as a list or nested lists
                     key_values[key] = value.tolist()
-        self.file.write(json.dumps(key_values) + "\n")
-        self.file.flush()
+        # self.file.write(json.dumps(key_values) + "\n")
+        # self.file.flush()
+        print(json.dumps(key_values))
 
     def close(self) -> None:
         """
@@ -262,6 +263,7 @@ def make_output_format(_format: str, log_dir: str, log_suffix: str = "") -> KVWr
     :param log_suffix: (str) the suffix for the log file
     :return: (KVWriter) the logger
     """
+    return JSONOutputFormat()
     os.makedirs(log_dir, exist_ok=True)
     if _format == "stdout":
         return HumanOutputFormat(sys.stdout)
@@ -545,7 +547,7 @@ class Logger(object):
 
 
 # Initialize logger
-Logger.DEFAULT = Logger.CURRENT = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout)])
+Logger.DEFAULT = Logger.CURRENT = Logger(folder=None, output_formats=[JSONOutputFormat(sys.stdout)])
 
 
 def configure(folder: Optional[str] = None, format_strings: Optional[List[str]] = None) -> None:
