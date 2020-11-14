@@ -119,7 +119,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         use_decoder=False,
         use_exploration_kl=False,
         decoder_method='diayn',
-        use_learned_sampler=True
+        use_learned_sampler=True,
+        continuous_contexts=False
     ):
 
         super(PPO, self).__init__(
@@ -156,6 +157,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.target_kl = target_kl
         self.use_context = use_context
+        self.continuous_contexts = continuous_contexts
 
         if self.use_learned_sampler:
             self.sample_chooser = SampleChooser(env.observation_space.sample().flatten().shape[0]).to(self.device)
@@ -234,9 +236,14 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         else:
             with th.no_grad():
                 context_predictions = self.decider(trajectory_features) # (batch, context_size)
-        error = F.cross_entropy(context_predictions,
-            th.argmax(th.tensor(context_targets).to(self.device, dtype=th.float), dim=-1),
-            reduce=with_grad)
+        if self.continuous_contexts:
+            error = th.sum(F.mse_loss(context_predictions,
+                th.tensor(context_targets).to(self.device, dtype=th.float),
+                reduce=with_grad), axis=-1)
+        else:
+            error = F.cross_entropy(context_predictions,
+                th.argmax(th.tensor(context_targets).to(self.device, dtype=th.float), dim=-1),
+                reduce=with_grad)
         return error
 
     def _annotate_context_error(self, trajectory_batch):
@@ -356,7 +363,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     action_space_size = 5
 
                     samples = rollout_data.observations[:num_obs_samples]
-                    contexts_to_use = np.identity(self.context_size)
+                    if not self.continuous_contexts:
+                        contexts_to_use = np.identity(self.context_size)
+                    else:
+                        contexts_to_use = np.random.random((self.context_size, self.context_size))
 
                     context_samples = []
                     action_samples = []
@@ -381,11 +391,14 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     if self.use_learned_sampler:
                         choices = self.sample_chooser.forward(state_samples[0:s_num])
 
+                    clip_val = 100
+
                     min_kl_val = 1e8
+                    min_kl_sampler_val = 1e8
                     for i in range(0, num_context_samples):
                         p_choices = div_log_probs[i*s_num:(i+1)*s_num]
                         for j in range(0, num_context_samples):
-                            dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)
+                            dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
                             
                             if i != j and dist_btw != 0:
                                 count += 1
@@ -398,14 +411,20 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 else:
                                     divs_policy = divs
 
-                                temp_kl_policy = th.clamp(th.sum(divs_policy), 0, 200)
+                                temp_kl_policy = th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
                                 if temp_kl_policy.cpu().item() < min_kl_val:
                                     min_kl_val = temp_kl_policy.cpu().item()
                                     kl_policy = temp_kl_policy
                                 
+                                # if self.use_learned_sampler:
+                                #     kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
+
                                 if self.use_learned_sampler:
-                                    kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
-                    
+                                    temp_kl_sampler = th.clamp(th.sum(divs_sampler), 0, clip_val)
+                                    if temp_kl_sampler.cpu().item() < min_kl_sampler_val:
+                                        min_kl_sampler_val = temp_kl_sampler.cpu().item()
+                                        kl_sampler = temp_kl_sampler
+
                     loss += -kl_policy
                     exploration_divs.append(kl_policy.cpu().item())
 
@@ -449,7 +468,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         if True:   
             logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
             # logger.record("train/avg_rew", rew/avg_rew)
-            # logger.record("train/entropy_loss", np.mean(entropy_losses))
+            logger.record("train/entropy_loss", np.mean(entropy_losses))
             logger.record("train/policy_gradient_loss", np.mean(pg_losses))
             logger.record("train/value_loss", np.mean(value_losses))
             logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
