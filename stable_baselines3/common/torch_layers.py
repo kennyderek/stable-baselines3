@@ -68,16 +68,22 @@ class NatureCNN(BaseFeaturesExtractor):
             "(you are probably using `CnnPolicy` instead of `MlpPolicy`)"
         )
         n_input_channels = observation_space.shape[0]
+        # self.cnn = nn.Sequential(
+        #     nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+        #     nn.ReLU(),
+        #     nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+        #     nn.ReLU(),
+        #     nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+        #     nn.ReLU(),
+        #     nn.Flatten(),
+        # )
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(n_input_channels, 8, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.Conv2d(8, 16, kernel_size=2, stride=1, padding=0),
             nn.ReLU(),
             nn.Flatten(),
         )
-
         # Compute shape by doing one forward pass
         with th.no_grad():
             n_flatten = self.cnn(th.as_tensor(observation_space.sample()[None]).float()).shape[1]

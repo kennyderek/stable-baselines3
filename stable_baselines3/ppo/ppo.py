@@ -35,9 +35,6 @@ class SampleChooser(nn.Module):
     def forward(self, input):
         return self.layers(input)
     
-    # def predict(self, input):
-    #     return nn.Softmax(self.forward(input)
-
 class PPO(TrajectoryOnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
@@ -360,7 +357,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 if self.use_exploration_kl:
                     num_context_samples = self.context_size
                     num_obs_samples = 100
-                    action_space_size = 5
+                    action_space_size = self.env.max_action_num
 
                     samples = rollout_data.observations[:num_obs_samples]
                     if not self.continuous_contexts:
