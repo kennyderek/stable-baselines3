@@ -117,7 +117,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         use_exploration_kl=False,
         decoder_method='diayn',
         use_learned_sampler=True,
-        continuous_contexts=False
+        continuous_contexts=False,
+        kl_clip_val=100,
+        pretrain_kl=0,
+        **kwargs
     ):
 
         super(PPO, self).__init__(
@@ -145,7 +148,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
             use_decoder=use_decoder,
             use_exploration_kl=use_exploration_kl,
             decoder_method=decoder_method,
-            use_learned_sampler=use_learned_sampler
+            use_learned_sampler=use_learned_sampler,
         )
 
         self.batch_size = batch_size
@@ -155,6 +158,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         self.target_kl = target_kl
         self.use_context = use_context
         self.continuous_contexts = continuous_contexts
+        self.kl_clip_val = kl_clip_val
+        self.pretrain_kl = pretrain_kl
 
         if self.use_learned_sampler:
             self.sample_chooser = SampleChooser(env.observation_space.sample().flatten().shape[0]).to(self.device)
@@ -352,18 +357,23 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
+                if self.num_timesteps < self.pretrain_kl:
+                    loss = 0
 
                 # define exploration loss
                 if self.use_exploration_kl:
-                    num_context_samples = self.context_size
-                    num_obs_samples = 100
+                    if self.continuous_contexts:
+                        num_context_samples = 4  # TODO: provide 10 as an cmd line argument
+                    else:
+                        num_context_samples = self.context_size
+                    num_obs_samples = 50 # TODO: find best parameter
                     action_space_size = self.env.max_action_num
 
-                    samples = rollout_data.observations[:num_obs_samples]
+                    samples = rollout_data.observations[:num_obs_samples] # This is a random sample of 50 states
                     if not self.continuous_contexts:
                         contexts_to_use = np.identity(self.context_size)
                     else:
-                        contexts_to_use = np.random.random((self.context_size, self.context_size))
+                        contexts_to_use = np.random.random((num_context_samples, self.context_size))
 
                     context_samples = []
                     action_samples = []
@@ -382,48 +392,78 @@ class PPO(TrajectoryOnPolicyAlgorithm):
 
                     kl_policy = 0
                     kl_sampler = 0
-                    s_num = samples.shape[0] * action_space_size # 6 is the number of actions
+                    s_num = samples.shape[0] * action_space_size
                     count = 0
 
                     if self.use_learned_sampler:
                         choices = self.sample_chooser.forward(state_samples[0:s_num])
 
-                    clip_val = 100
+                    clip_val = self.kl_clip_val
 
                     min_kl_val = 1e8
                     min_kl_sampler_val = 1e8
                     for i in range(0, num_context_samples):
+                        # print("hi")
                         p_choices = div_log_probs[i*s_num:(i+1)*s_num]
-                        for j in range(0, num_context_samples):
+                        for j in range(i+1, num_context_samples):
                             dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
-                            
+                            if self.continuous_contexts:
+                                dist_btw = dist_btw / self.context_size**(1/2)
+                            else:
+                                dist_btw = 1 if dist_btw != 0 else 0
                             if i != j and dist_btw != 0:
                                 count += 1
                                 q_choices = div_log_probs[j*s_num:(j+1)*s_num]
 
-                                divs = th.exp(p_choices) * (p_choices - q_choices)
+                                # OG distance metric!
+                                # divs = th.exp(p_choices) * (p_choices - q_choices)
+
+                                # Try new distance metric!
+                                divs = th.abs(th.exp(p_choices) - th.exp(q_choices))
+                                # print(th.sum(th.exp(p_choices) - th.exp(q_choices)))
+                                # print(th.sum(th.exp(p_choices)))
+                                # divs = divs[th.argmin(divs)]
+
                                 if self.use_learned_sampler:
                                     divs_policy = divs * th.flatten(choices).detach() * s_num
                                     divs_sampler = divs.detach() * th.flatten(choices) * s_num
                                 else:
                                     divs_policy = divs
+                                # kl_policy += th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
+                                # temp_kl_policy = th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
+                                # if self.continuous_contexts and False:
+                                #     if temp_kl_policy.cpu().item() < min_kl_val:
+                                #         min_kl_val = temp_kl_policy.cpu().item()
+                                #         kl_policy = temp_kl_policy
+                                # else:
+                                #     kl_policy += temp_kl_policy
 
-                                temp_kl_policy = th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
-                                if temp_kl_policy.cpu().item() < min_kl_val:
-                                    min_kl_val = temp_kl_policy.cpu().item()
-                                    kl_policy = temp_kl_policy
+                                # TODO: what should be clip_val?
+                                # clip_val = num_obs_samples
+                                clip_val = s_num
                                 
-                                # if self.use_learned_sampler:
-                                #     kl_sampler += th.clamp(th.sum(divs_sampler), 0, 200)
+                                # print(num_obs_samples)
+                                # print(th.sum(divs_policy))
+                                # kl_policy += th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
+                                kl_policy += th.sum(divs_policy)
+
+                                # Try new distance metric!
+                                # kl_policy += th.sum(divs_policy) * dist_btw
 
                                 if self.use_learned_sampler:
-                                    temp_kl_sampler = th.clamp(th.sum(divs_sampler), 0, clip_val)
-                                    if temp_kl_sampler.cpu().item() < min_kl_sampler_val:
-                                        min_kl_sampler_val = temp_kl_sampler.cpu().item()
-                                        kl_sampler = temp_kl_sampler
+                                    # print("heeeeloooo")
+                                    # temp_kl_sampler = th.clamp(th.sum(divs_sampler), 0, clip_val * dist_btw)
+                                    # if temp_kl_sampler.cpu().item() < min_kl_sampler_val:
+                                    #     min_kl_sampler_val = temp_kl_sampler.cpu().item()
+                                    #     kl_sampler = temp_kl_sampler
+                                    kl_sampler += th.sum(divs_sampler) * dist_btw
 
-                    loss += -kl_policy
+                    loss += -kl_policy # TODO: didn't do this for the field experiments
                     exploration_divs.append(kl_policy.cpu().item())
+
+                    # what if we want to maximize the Reward, by choosing which states to use in our KL-term?
+                    # or we choose the highest value state and maximize divergence there?
+                    # ORRRR we only consider states that have a low entropy of actions!!!
 
                     if self.use_learned_sampler:
                         self.sample_optimizer.zero_grad()
