@@ -19,7 +19,6 @@ from stable_baselines3.common.preprocessing import is_image_space
 from stable_baselines3.common.type_aliases import GymEnv
 from stable_baselines3.common.vec_env import VecTransposeImage
 
-
 def set_random_seed(seed: int, using_cuda: bool = False) -> None:
     """
     Seed the different random generators

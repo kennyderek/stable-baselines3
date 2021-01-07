@@ -207,9 +207,18 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
                 fps = int(self.num_timesteps / (time.time() - self.start_time))
                 if True:
                     logger.record("time/iterations", iteration, exclude="tensorboard")
-                    if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
-                        logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
-                        logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                    if len(self.ep_info_buffer) > 0:
+                    # logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    # logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                        total_chickens = sum(self.ep_info_buffer["avc"])
+                        total_towers = sum(self.ep_info_buffer["avt"])
+                        total = total_chickens + total_towers + 1e-8
+                        logger.record("rollout/avt", (total_towers))
+                        logger.record("rollout/avc", (total_chickens))
+                        logger.record("rollout/eps_length", sum(self.ep_info_buffer["l"])/len(self.ep_info_buffer["l"]))
+                        if "agent_entropies" in self.ep_info_buffer:
+                            logger.record("rollout/agent_ent", sum(self.ep_info_buffer["agent_entropies"])/len(self.ep_info_buffer["agent_entropies"]))
+                        self.ep_info_buffer = {}
                     logger.record("time/fps", fps)
                     logger.record("time/time_elapsed", int(time.time() - self.start_time), exclude="tensorboard")
                     logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
@@ -317,6 +326,7 @@ class OnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                 return False
 
             self._update_info_buffer(infos)
+
             n_steps += 1
             self.num_timesteps += env.num_envs
 
@@ -452,7 +462,15 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                     ctx_tensor = th.as_tensor(self.dict_obs_to_array(contexts, key_list), dtype=th.float32).to(self.device)
                 else:
                     ctx_tensor = None
-                actions, values, log_probs = self.policy.forward(obs_tensor, ctx_tensor)
+                try:
+                    # print(obs_tensor.shape)
+                    # print(ctx_tensor.shape)
+                    actions, values, log_probs = self.policy.forward(obs_tensor, ctx_tensor)
+                except:
+                    print("ERROR!")
+                    print(obs_tensor)
+                    print(ctx_tensor)
+                    print("on timestep:", n_steps)
             actions = actions.cpu().numpy()
             dict_actions = self.array_to_dict_actions(actions, key_list)
             dict_values = self.array_to_dict_actions(values, key_list)
@@ -471,7 +489,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
             if callback.on_step() is False:
                 return False
 
-            # self._update_info_buffer(infos) # Remove use of info buffer for now
+            self._update_info_buffer(infos) # Remove use of info buffer for now
             n_steps += 1
             # self.num_timesteps += env.num_envs
             self.num_timesteps += 1
@@ -505,6 +523,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                         # del dict_values[agent_id]
             self._last_obs = new_obs
             self._last_dones = dones
+            # self._last_ctx = contexts
 
         rollout_buffer.compute_returns_and_advantage(dict_values)
 

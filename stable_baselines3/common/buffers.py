@@ -483,6 +483,7 @@ class TrajRolloutBuffer():
         self.live_agents : Dict[int, int] = {} # env agent-id -> buffer-unique
         self.trajectories : Dict[int, TrajectoryBufferSamples] = {} # buffer-unique id -> trajectory
         self.num_done_trajectories = 0
+        self.buffer_size = 0
         self.use_context = use_context
 
     def size(self) -> int:
@@ -518,7 +519,10 @@ class TrajRolloutBuffer():
 
     def add(self, agent_id:int, context:np.ndarray, done:bool, **kwargs) -> None:
         '''
-        Takes a singular (o, a, r, d, v) group from an agent
+        Takes a singular agent step's data
+        Increment's buffer size by 1
+
+        kwargs: contains obs, action, reward, value, log_prob
         '''
         unique_id = None
         if agent_id not in self.live_agents:
@@ -534,12 +538,16 @@ class TrajRolloutBuffer():
                 self.full = True
             self.live_agents.pop(agent_id)
         
+        self.buffer_size += 1
+        if self.buffer_size > 10000:
+            self.full = True
         self.trajectories[unique_id].add(**kwargs)
 
     def reset(self) -> None:
         """
         Reset the buffer.
         """
+        self.buffer_size = 0
         self.traj_idx = 0
         self.num_done_trajectories = 0
         self.full = False
@@ -547,7 +555,7 @@ class TrajRolloutBuffer():
         self.live_agents = {}
         self.trajectories = {}
 
-    def format_trajectories(self, trajectories : List[TrajectoryBufferSamples]) -> RolloutBufferSamples:
+    def format_trajectories(self, trajectories : List[TrajectoryBufferSamples], to_torch=True) -> RolloutBufferSamples:
         observations = np.concatenate([t.observations for t in trajectories]).squeeze()
         actions = np.concatenate([t.actions for t in trajectories]).squeeze()
         returns = np.concatenate([t.returns for t in trajectories]).squeeze()
@@ -555,7 +563,8 @@ class TrajRolloutBuffer():
         log_probs = np.concatenate([t.log_probs for t in trajectories]).squeeze()
         advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
         if self.use_context:
-            context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
+            # context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
+            context_error = np.zeros(values.shape)
             contexts = np.concatenate([np.broadcast_to(t.context, shape=(t.buffer_size,) + t.context.shape) for t in trajectories])
         else:
             context_error = np.zeros(values.shape)
@@ -574,20 +583,61 @@ class TrajRolloutBuffer():
             returns[indices],
             context_error[indices]
         )
-        return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+        if to_torch:
+            return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+        else:
+            return RolloutBufferSamples(*data)
 
     def get(self, batch_size: Optional[int] = None) -> Generator[TrajectoryBufferSamples, None, None]:
+        '''
+        Iterator to yield a batch of at maximum <batch_size> trajectories.
+        No gaurantee on number of states in each of these trajectories.
+        '''
         assert self.full, ""
-        indices = np.random.permutation(self.num_trajectories)
+        indices = np.random.permutation(self.traj_idx-1)
 
         # Return everything, don't create minibatches
         if batch_size is None:
-            batch_size = self.num_trajectories
+            batch_size = self.traj_idx-1
 
         start_idx = 0
-        while start_idx < self.num_trajectories:
+        while start_idx < self.traj_idx:
             yield [self.trajectories[i] for i in indices[start_idx : start_idx + batch_size]]
             start_idx += batch_size
+
+    def get_state_samples(self, num_batches, to_torch=True):
+        '''
+        Iterator to yield <num_batches> batches equal size batches of epoch data.
+        '''
+        rollout_buffer : RolloutBufferSamples = self.format_trajectories(list(self.trajectories.values()), to_torch = False)
+
+        # indices = np.arange(self.traj_idx-1)
+        # np.random.shuffle(indices)
+
+        start_idx = 0
+        data_len = len(rollout_buffer.observations)
+        batch_size = data_len // num_batches
+        end_idx = [0]
+        for i in range(num_batches-1):
+            end_idx.append((i+1)*batch_size)
+        end_idx.append(data_len)
+        i = 0
+        for i in range(1, len(end_idx)):
+            data = (
+                rollout_buffer.observations[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.contexts[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.actions[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.old_values[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.old_log_prob[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.advantages[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.returns[end_idx[i-1]:end_idx[i]],
+                rollout_buffer.context_error[end_idx[i-1]:end_idx[i]]
+            )
+            batch = RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+            yield batch
+            start_idx += batch_size
+            i += 0
+
 
     def compute_returns_and_advantage(self, last_value: Dict[int, th.Tensor] = {}) -> None:
         done = set([])

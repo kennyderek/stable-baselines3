@@ -139,6 +139,8 @@ class BaseAlgorithm(ABC):
         # For logging
         self._n_updates = 0  # type: int
 
+        # self.ep_info_buffer = {} # a dictionary of data name --> list of that data attribute
+
         # Create and wrap the env if needed
         if env is not None:
             if isinstance(env, str):
@@ -398,7 +400,7 @@ class BaseAlgorithm(ABC):
     def _init_callback(
         self,
         callback: MaybeCallback,
-        eval_env: Optional[VecEnv] = None,
+        eval_env: Optional[GymEnv] = None,
         eval_freq: int = 10000,
         n_eval_episodes: int = 5,
         log_path: Optional[str] = None,
@@ -460,8 +462,9 @@ class BaseAlgorithm(ABC):
         self.start_time = time.time()
         if self.ep_info_buffer is None or reset_num_timesteps:
             # Initialize buffers if they don't exist, or reinitialize if resetting counters
-            self.ep_info_buffer = deque(maxlen=100)
-            self.ep_success_buffer = deque(maxlen=100)
+            # self.ep_info_buffer = deque(maxlen=100)
+            # self.ep_success_buffer = deque(maxlen=100)
+            self.ep_info_buffer = {}
 
         if self.action_noise is not None:
             self.action_noise.reset()
@@ -505,15 +508,23 @@ class BaseAlgorithm(ABC):
 
         :param infos: ([dict])
         """
-        if dones is None:
-            dones = np.array([False] * len(infos))
-        for idx, info in enumerate(infos):
-            maybe_ep_info = info.get("episode")
-            maybe_is_success = info.get("is_success")
-            if maybe_ep_info is not None:
-                self.ep_info_buffer.extend([maybe_ep_info])
-            if maybe_is_success is not None and dones[idx]:
-                self.ep_success_buffer.append(maybe_is_success)
+        # if dones is None:
+        #     dones = np.array([False] * len(infos))
+        # for idx, info in enumerate(infos):
+        #     maybe_ep_info = info.get("episode")
+        #     # maybe_is_success = info.get("is_success")
+        #     if maybe_ep_info is not None:
+        #         self.ep_info_buffer.extend([maybe_ep_info])
+        #     # if maybe_is_success is not None and dones[idx]:
+        #     #     self.ep_success_buffer.append(maybe_is_success)
+
+        if len(infos) != 0:
+            # self.ep_info_buffer.append(infos)
+            for k, v in infos.items():
+                if k in self.ep_info_buffer:
+                    self.ep_info_buffer[k].append(v)
+                else:
+                    self.ep_info_buffer[k] = [v]
 
     def excluded_save_params(self) -> List[str]:
         """

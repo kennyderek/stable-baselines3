@@ -262,6 +262,79 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 t.context_error = error[current_idx:current_idx+t.buffer_size]
                 current_idx += t.buffer_size
 
+    def _get_context_loss_samples(self, rollout_data):
+        '''
+        Build context, state, action samples to determine context loss
+        '''
+        if self.continuous_contexts:
+            self.num_context_samples = 16  # TODO: provide 10 as an cmd line argument
+            self.contexts_to_use = np.random.random((self.num_context_samples, self.context_size))
+        else:
+            self.num_context_samples = self.context_size
+            self.contexts_to_use = np.identity(self.context_size)
+            # Use a random sample of the possible contexts
+            # num_context_samples = 6
+            # contexts_to_use =  np.identity(self.context_size)[np.random.choice(self.context_size, num_context_samples, replace=False)]
+        
+        self.num_obs_samples = 50 # TODO: find best parameter
+        # action_space_size = self.env.max_action_num
+        samples = rollout_data.observations[:self.num_obs_samples] # This is a random sample of 50 states
+
+        context_samples = []
+        action_samples = []
+        state_samples = []
+        for c in self.contexts_to_use:
+            c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + (self.context_size,))))#.to(self.device)
+            for action in range(0, self.env.max_action_num):
+                a = th.tensor(np.ones(samples.shape[0]) * action)
+                action_samples.append(a)
+                context_samples.append(c)
+                state_samples.append(samples)
+        with th.no_grad():
+            context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
+            action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
+            state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
+
+        '''
+        Data looks like:
+        ___context_0___|___context_1___|___context_2___|...|
+        _a_0_|_a_1_|...|_a_0_|_a_1_|...|...
+        s1|s2|s1|s2|...
+        '''
+        return (context_samples, action_samples, state_samples)
+
+    def _get_context_loss(self, context_samples, action_samples, state_samples):
+
+        _, div_log_probs, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples)
+
+        s_num = self.num_obs_samples * self.env.max_action_num # the number of (s, a) pairs in a context region of data
+        count = 0
+        loss = 0
+
+        for i in range(0, self.num_context_samples):
+            p_choices = div_log_probs[i*s_num:(i+1)*s_num]
+            for j in range(i+1, self.num_context_samples):
+                dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
+                # print(context_samples[i*s_num], context_samples[j*s_num])
+                if self.continuous_contexts:
+                    dist_btw = dist_btw / self.context_size**(1/2) # divide it by the max magnitude
+                else:
+                    dist_btw = 1 if dist_btw != 0 else 0
+                if i != j and dist_btw != 0:
+                    count += 1
+                    q_choices = div_log_probs[j*s_num:(j+1)*s_num]
+                    # OG distance metric!
+                    # divs = th.exp(p_choices) * (p_choices - q_choices)
+                    # Try new distance metric!
+                    divs = th.abs(th.exp(p_choices) - th.exp(q_choices))
+                    assert 0 <= dist_btw <= 1
+                    # print(dist_btw)
+                    # print(th.sum(divs))
+                    # loss += th.abs(dist_btw - th.sum(divs)/100)
+                    loss += th.clamp(-th.sum(divs), -100*dist_btw, 0)
+
+        return loss / count
+
     def train(self) -> None:
         """
         Update policy using the currently gathered
@@ -282,24 +355,29 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         sampler_density, sampler_loss = [], []
 
         # use_decider = False
-        if self.use_context and self.use_decoder:
-            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                self._annotate_context_error(trajectory_batch)
-        else:
-            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
-                for idx, t in enumerate(trajectory_batch):
-                    t.context_error = np.ones(t.rewards.shape)
-        
-        self.rollout_buffer.compute_returns_and_advantage()
+        # if self.use_context and self.use_decoder:
+        #     for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+        #         self._annotate_context_error(trajectory_batch)
+        # else:
+        #     for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+        #         for idx, t in enumerate(trajectory_batch):
+        #             t.context_error = np.ones(t.rewards.shape)
+
+        # this should not be here, unless we want to recompute the value after setting the
+        # rewards to the context error
+        # if we do call it, we should make sure to use last_value as an argument
+        # self.rollout_buffer.compute_returns_and_advantage()
 
         # train for gradient_steps epochs
+        context_samples = None
         num_steps_in_epoch = 0
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
-            for trajectory_batch in self.rollout_buffer.get(self.batch_size):
+            for rollout_data in self.rollout_buffer.get_state_samples(5):
+            # for trajectory_batch in self.rollout_buffer.get(self.batch_size):
 
-                rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
+                # rollout_data = self.rollout_buffer.format_trajectories(trajectory_batch)
                 num_steps_in_epoch += rollout_data.actions.shape[0]
 
                 actions = rollout_data.actions
@@ -362,119 +440,13 @@ class PPO(TrajectoryOnPolicyAlgorithm):
 
                 # define exploration loss
                 if self.use_exploration_kl:
-                    if self.continuous_contexts:
-                        num_context_samples = 4  # TODO: provide 10 as an cmd line argument
-                    else:
-                        num_context_samples = self.context_size
-                    num_obs_samples = 50 # TODO: find best parameter
-                    action_space_size = self.env.max_action_num
+                    # if context_samples == None:
+                    context_samples = self._get_context_loss_samples(rollout_data)
 
-                    samples = rollout_data.observations[:num_obs_samples] # This is a random sample of 50 states
-                    if not self.continuous_contexts:
-                        contexts_to_use = np.identity(self.context_size)
-                    else:
-                        contexts_to_use = np.random.random((num_context_samples, self.context_size))
-
-                    context_samples = []
-                    action_samples = []
-                    state_samples = []
-                    for c in contexts_to_use:
-                        c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + (self.context_size,))))#.to(self.device)
-                        for action in range(0, action_space_size):
-                            a = th.tensor(np.ones(samples.shape[0]) * action)
-                            action_samples.append(a)
-                            context_samples.append(c)
-                            state_samples.append(samples)
-                    context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
-                    action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
-                    state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
-                    _, div_log_probs, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples)
-
-                    kl_policy = 0
-                    kl_sampler = 0
-                    s_num = samples.shape[0] * action_space_size
-                    count = 0
-
-                    if self.use_learned_sampler:
-                        choices = self.sample_chooser.forward(state_samples[0:s_num])
-
-                    clip_val = self.kl_clip_val
-
-                    min_kl_val = 1e8
-                    min_kl_sampler_val = 1e8
-                    for i in range(0, num_context_samples):
-                        # print("hi")
-                        p_choices = div_log_probs[i*s_num:(i+1)*s_num]
-                        for j in range(i+1, num_context_samples):
-                            dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
-                            if self.continuous_contexts:
-                                dist_btw = dist_btw / self.context_size**(1/2)
-                            else:
-                                dist_btw = 1 if dist_btw != 0 else 0
-                            if i != j and dist_btw != 0:
-                                count += 1
-                                q_choices = div_log_probs[j*s_num:(j+1)*s_num]
-
-                                # OG distance metric!
-                                # divs = th.exp(p_choices) * (p_choices - q_choices)
-
-                                # Try new distance metric!
-                                divs = th.abs(th.exp(p_choices) - th.exp(q_choices))
-                                # print(th.sum(th.exp(p_choices) - th.exp(q_choices)))
-                                # print(th.sum(th.exp(p_choices)))
-                                # divs = divs[th.argmin(divs)]
-
-                                if self.use_learned_sampler:
-                                    divs_policy = divs * th.flatten(choices).detach() * s_num
-                                    divs_sampler = divs.detach() * th.flatten(choices) * s_num
-                                else:
-                                    divs_policy = divs
-                                # kl_policy += th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
-                                # temp_kl_policy = th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
-                                # if self.continuous_contexts and False:
-                                #     if temp_kl_policy.cpu().item() < min_kl_val:
-                                #         min_kl_val = temp_kl_policy.cpu().item()
-                                #         kl_policy = temp_kl_policy
-                                # else:
-                                #     kl_policy += temp_kl_policy
-
-                                # TODO: what should be clip_val?
-                                # clip_val = num_obs_samples
-                                clip_val = s_num
-                                
-                                # print(num_obs_samples)
-                                # print(th.sum(divs_policy))
-                                # kl_policy += th.clamp(th.sum(divs_policy), 0, clip_val * dist_btw)
-                                kl_policy += th.sum(divs_policy)
-
-                                # Try new distance metric!
-                                # kl_policy += th.sum(divs_policy) * dist_btw
-
-                                if self.use_learned_sampler:
-                                    # print("heeeeloooo")
-                                    # temp_kl_sampler = th.clamp(th.sum(divs_sampler), 0, clip_val * dist_btw)
-                                    # if temp_kl_sampler.cpu().item() < min_kl_sampler_val:
-                                    #     min_kl_sampler_val = temp_kl_sampler.cpu().item()
-                                    #     kl_sampler = temp_kl_sampler
-                                    kl_sampler += th.sum(divs_sampler) * dist_btw
-
-                    loss += -kl_policy # TODO: didn't do this for the field experiments
-                    exploration_divs.append(kl_policy.cpu().item())
-
-                    # what if we want to maximize the Reward, by choosing which states to use in our KL-term?
-                    # or we choose the highest value state and maximize divergence there?
-                    # ORRRR we only consider states that have a low entropy of actions!!!
-
-                    if self.use_learned_sampler:
-                        self.sample_optimizer.zero_grad()
-                        # we want to minimize divergence
-                        entropy_of_choices = th.sum(-choices * th.log(choices))
-                        sample_loss = kl_sampler# + entropy_of_choices# + (0.25 - th.sum(choices[:,:1])/len(choices))**2 # we want NON ENTROPIC choices!!
-                        sample_loss.backward(retain_graph=True)
-                        self.sample_optimizer.step()
-                        sampler_density.append(entropy_of_choices.item())
-                        sampler_loss.append(sample_loss.cpu().item())
-
+                    context_loss = self._get_context_loss(*context_samples)
+                    exploration_divs.append(context_loss.cpu().item())
+                    loss += context_loss
+                
                 # Optimization step
                 self.policy.optimizer.zero_grad()
                 loss.backward()
@@ -503,7 +475,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
 
         # Logs
         if True:   
-            logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
+            # logger.record("train/avg_episode_len", num_steps_in_epoch/(self.n_epochs * self.n_trajectories))
             # logger.record("train/avg_rew", rew/avg_rew)
             logger.record("train/entropy_loss", np.mean(entropy_losses))
             logger.record("train/policy_gradient_loss", np.mean(pg_losses))

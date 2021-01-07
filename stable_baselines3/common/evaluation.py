@@ -6,13 +6,14 @@ import numpy as np
 
 from stable_baselines3.common.vec_env import VecEnv
 
+from stable_baselines3.common import context_utils
+
 if typing.TYPE_CHECKING:
     from stable_baselines3.common.base_class import BaseAlgorithm
 
-
 def evaluate_policy(
     model: "BaseAlgorithm",
-    env: Union[gym.Env, VecEnv],
+    env: Union[gym.Env, VecEnv], # TODO: not actually a VecEnv
     n_eval_episodes: int = 10,
     deterministic: bool = True,
     render: bool = False,
@@ -44,23 +45,37 @@ def evaluate_policy(
 
     episode_rewards, episode_lengths = [], []
     for i in range(n_eval_episodes):
-        # Avoid double reset, as VecEnv are reset automatically
-        if not isinstance(env, VecEnv) or i == 0:
-            obs = env.reset()
+        obs = env.reset()
+        if "__contexts__" in obs.keys():
+            contexts = obs.pop("__contexts__")
+        num_agents = len(obs)
         done, state = False, None
         episode_reward = 0.0
         episode_length = 0
-        while not done:
-            action, state = model.predict(obs, state=state, deterministic=deterministic)
-            obs, reward, done, _info = env.step(action)
-            episode_reward += reward
+        while True:
+            if "__contexts__" in obs:
+                obs.pop("__contexts__")
+            keylist = list(obs.keys())
+
+            ctx_array = context_utils.dict_obs_to_array(contexts, keylist)
+            obs_array = context_utils.dict_obs_to_array(obs, keylist)
+            actions, _states = model.predict(obs_array, ctx_array, deterministic=deterministic)
+            action_dict = context_utils.array_to_dict_actions(actions, keylist)
+            obs, rewards, done, _info = env.step(action_dict)
+            episode_reward += sum([rewards[k] for k in rewards])
+
             if callback is not None:
                 callback(locals(), globals())
-            episode_length += 1
+            episode_length += len(action_dict)
             if render:
                 env.render()
+            
+            if done["__all__"]:
+                break
+
+
         episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
+        episode_lengths.append(episode_length/num_agents)
     mean_reward = np.mean(episode_rewards)
     std_reward = np.std(episode_rewards)
     if reward_threshold is not None:

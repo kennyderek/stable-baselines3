@@ -302,8 +302,8 @@ class EvalCallback(EventCallback):
         self.render = render
 
         # Convert to VecEnv for consistency
-        if not isinstance(eval_env, VecEnv):
-            eval_env = DummyVecEnv([lambda: eval_env])
+        # if not isinstance(eval_env, VecEnv):
+        #     eval_env = DummyVecEnv([lambda: eval_env])
 
         if isinstance(eval_env, VecEnv):
             assert eval_env.num_envs == 1, "You must pass only one environment for evaluation"
