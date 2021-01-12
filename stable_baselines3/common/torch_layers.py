@@ -77,10 +77,21 @@ class NatureCNN(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
+        # self.cnn = nn.Sequential(
+        #     nn.Conv2d(n_input_channels, 32, kernel_size=6, stride=3, padding=0),
+        #     nn.ReLU(),
+        #     nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+        #     nn.ReLU(),
+        #     nn.Conv2d(64, 64, kernel_size=2, stride=1, padding=0),
+        #     nn.ReLU(),
+        #     nn.Flatten(),
+        # )
+        print("hello!! there!!")
 
         # Compute shape by doing one forward pass
         with th.no_grad():
             n_flatten = self.cnn(th.as_tensor(observation_space.sample()[None]).float()).shape[1]
+            print("size of observation encoding:", n_flatten)
 
         self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
 
