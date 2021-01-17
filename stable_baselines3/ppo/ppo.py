@@ -34,7 +34,9 @@ class SampleChooser(nn.Module):
 
     def forward(self, input):
         return self.layers(input)
-    
+
+
+
 class PPO(TrajectoryOnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
@@ -279,6 +281,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         pg_losses, value_losses, decider_losses = [], [], []
         clip_fractions = []
         exploration_divs = []
+        embedding_divs = []
         sampler_density, sampler_loss = [], []
 
         # use_decider = False
@@ -389,7 +392,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
                     action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
                     state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
-                    _, div_log_probs, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples)
+                    _, div_log_probs, _, latent_pi, latent_vf, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples, return_all=True)
+
+                    # state_samples_singular = th.tensor(samples).to(self.device, dtype=th.float)
+                    # latent_pi, latent_vf, _ = self.policy._get_latent(state_samples_singular, context_samples)
 
                     kl_policy = 0
                     s_num = samples.shape[0] * action_space_size
@@ -397,9 +403,31 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                     count = 0
                     min_kl_policy = 1e8
                     max_kl_policy = -1e8
+                    kl_emb = 0
                     for i in range(0, num_context_samples):
                         p_choices = div_log_probs[i*s_num:(i+1)*s_num]
+
+                        '''
+                        NEW
+                        '''
+                        p_emb_pi, p_emb_vf = latent_pi[i*s_num:(i+1)*s_num], latent_vf[i*s_num:(i+1)*s_num]
+
                         for j in range(i+1, num_context_samples):
+
+                            '''
+                            As suggested in BigGAN-AM paper:
+                            '''
+                            # q_choices = div_log_probs[j*s_num:(j+1)*s_num]
+                            ci = context_samples[i*s_num]
+                            cj = context_samples[j*s_num]
+                            # p = th.exp(p_choices)
+                            # q = th.exp(q_choices)
+                            # kl_policy -= (th.sum((p - q)**2))**(1/2) / (th.sum((ci - cj)**2))**(1/2) # we want to maximize this value
+                            # count += 1
+
+                            '''
+                            Homebrewed CL loss:
+                            '''
                             dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
                             if self.continuous_contexts:
                                 dist_btw = dist_btw / self.context_size**(1/2)
@@ -408,25 +436,28 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                             if i != j and dist_btw != 0:
                                 count += 1
                                 q_choices = div_log_probs[j*s_num:(j+1)*s_num]
-                                # OG distance metric!
-                                # divs = th.exp(p_choices) * (p_choices - q_choices)
-                                # Try new distance metric!
-                                # print(max_div_val)
                                 divs = th.sum(th.abs(th.exp(p_choices) - th.exp(q_choices)))
-                                # print(p_choices, q_choices, divs)
                                 assert (0 <= divs.cpu().item() <= max_div_val), "divs is " + str(divs.cpu().item())
-                                # if divs - 10 > max_div_val:
-                                #     print(divs)
-
-                                # kl_policy += divs * dist_btw
                                 kl_policy += ((divs / max_div_val) - dist_btw)**(2)
 
-                                # if divs.cpu().item() > max_kl_policy:
-                                #     kl_policy = divs
-                                #     max_kl_policy = divs.cpu().item()
+                                '''
+                                New term to encourage distance between embeddings:
+                                '''
+                                q_emb_pi, q_emb_vf = latent_pi[j*s_num:(j+1)*s_num], latent_vf[j*s_num:(j+1)*s_num]
+
+                                max_emb_div = s_num * 64 * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
+                                emb_divs = th.sum(th.abs(p_emb_pi - q_emb_pi))
+                                kl_emb += (emb_divs / max_emb_div - dist_btw)**2
+                                
+                                val_divs = th.sum(th.abs(p_emb_vf - q_emb_vf))
+                                kl_emb += (val_divs / max_emb_div - dist_btw)**2
+                                # kl_emb -= th.norm(p_emb_vf - q_emb_vf) / th.norm(ci - cj)
 
                     loss += kl_policy / count # TODO: didn't do this for the field experiments
+                    loss += kl_emb / count
+
                     exploration_divs.append(kl_policy.cpu().item() / count)
+                    embedding_divs.append(kl_emb.cpu().item() / count)
 
                     # what if we want to maximize the Reward, by choosing which states to use in our KL-term?
                     # or we choose the highest value state and maximize divergence there?
@@ -476,6 +507,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
             logger.record("train/policy_gradient_loss", np.mean(pg_losses))
             logger.record("train/value_loss", np.mean(value_losses))
             logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
+            logger.record("train/embedding_divergence", np.mean(np.array(embedding_divs)))
             logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
             logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
             logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
