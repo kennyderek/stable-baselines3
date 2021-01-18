@@ -445,7 +445,8 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 '''
                                 q_emb_pi, q_emb_vf = latent_pi[j*s_num:(j+1)*s_num], latent_vf[j*s_num:(j+1)*s_num]
 
-                                max_emb_div = s_num * 64 * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
+                                max_emb_div = p_emb_pi.shape[0] * p_emb_pi.shape[1] * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
+                                
                                 emb_divs = th.sum(th.abs(p_emb_pi - q_emb_pi))
                                 kl_emb += (emb_divs / max_emb_div - dist_btw)**2
                                 
