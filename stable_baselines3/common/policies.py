@@ -380,7 +380,7 @@ class ActorCriticPolicy(BasePolicy):
                 # net_arch = [dict(pi=[64, 64], vf=[64, 64])]
             else:
                 net_arch = []
-        # net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
+                net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
