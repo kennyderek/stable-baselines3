@@ -428,9 +428,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                             '''
                             Homebrewed CL loss:
                             '''
-                            dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
+                            # dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
+                            dist_btw = th.sum(th.abs(ci - cj))
                             if self.continuous_contexts:
-                                dist_btw = dist_btw / self.context_size**(1/2)
+                                dist_btw = dist_btw / self.context_size
                             else:
                                 dist_btw = 1 if dist_btw != 0 else 0
                             if i != j and dist_btw != 0:
@@ -445,7 +446,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 '''
                                 q_emb_pi, q_emb_vf = latent_pi[j*s_num:(j+1)*s_num], latent_vf[j*s_num:(j+1)*s_num]
 
-                                max_emb_div = s_num * 64 * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
+                                max_emb_div = s_num * 128 * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
                                 emb_divs = th.sum(th.abs(p_emb_pi - q_emb_pi))
                                 kl_emb += (emb_divs / max_emb_div - dist_btw)**2
                                 

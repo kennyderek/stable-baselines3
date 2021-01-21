@@ -376,7 +376,7 @@ class ActorCriticPolicy(BasePolicy):
         # Default network architecture, from stable-baselines
         if net_arch is None:
             if features_extractor_class == FlattenExtractor:
-                net_arch = [dict(pi=[64, 64, 64], vf=[64, 64, 64])]
+                net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
                 # net_arch = [dict(pi=[64, 64], vf=[64, 64])]
             else:
                 net_arch = []
