@@ -268,7 +268,15 @@ class CategoricalDistribution(Distribution):
             of the policy network (before the action layer)
         :return: (nn.Linear)
         """
-        action_logits = nn.Linear(latent_dim, self.action_dim)
+        # action_logits = nn.Linear(latent_dim, self.action_dim)
+        action_logits = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.action_dim)
+        )
+        
         return action_logits
 
     def proba_distribution(self, action_logits: th.Tensor) -> "CategoricalDistribution":

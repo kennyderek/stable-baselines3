@@ -370,28 +370,36 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                         num_context_samples = 8  # TODO: provide 10 as an cmd line argument
                     else:
                         num_context_samples = self.context_size
-                    num_obs_samples = 50 # TODO: find best parameter
+                    num_obs_samples = 100 # TODO: find best parameter
                     action_space_size = self.env.max_action_num
 
-                    samples = rollout_data.observations[:num_obs_samples] # This is a random sample of 50 states
-                    if not self.continuous_contexts:
-                        contexts_to_use = np.identity(self.context_size)
-                    else:
-                        contexts_to_use = np.random.random((num_context_samples, self.context_size))
+                    # what if we only care about diversifying between actions that actually make a difference in the outcome of the next state?
 
-                    context_samples = []
-                    action_samples = []
-                    state_samples = []
-                    for c in contexts_to_use:
-                        c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + (self.context_size,))))#.to(self.device)
-                        for action in range(0, action_space_size):
-                            a = th.tensor(np.ones(samples.shape[0]) * action)
-                            action_samples.append(a)
-                            context_samples.append(c)
-                            state_samples.append(samples)
-                    context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
-                    action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
-                    state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
+                    samples = rollout_data.observations[:num_obs_samples] # This is a random sample of 50 states
+                    # samples = np.stack([self.env.observation_space.sample() for _ in range(0, 10)])
+                    # samples = th.tensor(samples, dtype=th.float)
+
+                    with th.no_grad():
+                        if not self.continuous_contexts:
+                            contexts_to_use = np.identity(self.context_size)
+                        else:
+                            contexts_to_use = np.random.random((num_context_samples, self.context_size))
+
+                        context_samples = []
+                        action_samples = []
+                        state_samples = []
+                        for c in contexts_to_use:
+                            c = th.tensor(copy.deepcopy(np.broadcast_to(c, (samples.shape[0],) + (self.context_size,))))#.to(self.device)
+                            for action in range(0, action_space_size):
+                                a = th.tensor(np.ones(samples.shape[0]) * action)
+                                action_samples.append(a)
+                                context_samples.append(c)
+                                state_samples.append(samples)
+                        context_samples = th.cat(context_samples, 0).to(self.device, dtype=th.float)
+                        action_samples = th.cat(action_samples, 0).to(self.device, dtype=th.float)
+                        state_samples = th.cat(state_samples, 0).to(self.device, dtype=th.float)
+
+
                     _, div_log_probs, _, latent_pi, latent_vf, _ = self.policy.evaluate_actions(state_samples, context_samples, action_samples, return_all=True)
 
                     # state_samples_singular = th.tensor(samples).to(self.device, dtype=th.float)
@@ -425,13 +433,24 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                             # kl_policy -= (th.sum((p - q)**2))**(1/2) / (th.sum((ci - cj)**2))**(1/2) # we want to maximize this value
                             # count += 1
 
+                            ci_first, ci_second = th.split(ci, self.context_size // 2, dim=-1)
+                            cj_first, cj_second = th.split(cj, self.context_size // 2, dim=-1)
+
                             '''
                             Homebrewed CL loss:
                             '''
                             # dist_btw = th.sum((context_samples[i*s_num] - context_samples[j*s_num]) ** 2)**(1/2)
                             dist_btw = th.sum(th.abs(ci - cj))
+
+                            dist_first = th.sum(th.abs(ci_first - cj_first))
+                            dist_second = th.sum(th.abs(ci_second - cj_second))
+
                             if self.continuous_contexts:
                                 dist_btw = dist_btw / self.context_size
+
+                                dist_btw_first = dist_first / self.context_size * 2
+                                dist_btw_second = dist_second / self.context_size * 2
+                                # print(ci_first, ci_second, dist_btw_first)
                             else:
                                 dist_btw = 1 if dist_btw != 0 else 0
                             if i != j and dist_btw != 0:
@@ -439,7 +458,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 q_choices = div_log_probs[j*s_num:(j+1)*s_num]
                                 divs = th.sum(th.abs(th.exp(p_choices) - th.exp(q_choices)))
                                 assert (0 <= divs.cpu().item() <= max_div_val), "divs is " + str(divs.cpu().item())
-                                kl_policy += ((divs / max_div_val) - dist_btw)**(2)
+                                kl_policy += th.abs((divs / max_div_val) - (dist_btw))
 
                                 '''
                                 New term to encourage distance between embeddings:
@@ -449,10 +468,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                                 max_emb_div = p_emb_pi.shape[0] * p_emb_pi.shape[1] * 2 # Number of (state, action, context) samples x Hidden layer dimension x Max variation of hidden layer
                                 
                                 emb_divs = th.sum(th.abs(p_emb_pi - q_emb_pi))
-                                kl_emb += (emb_divs / max_emb_div - dist_btw)**2
+                                kl_emb += th.abs(emb_divs / max_emb_div - dist_btw_first)
                                 
                                 val_divs = th.sum(th.abs(p_emb_vf - q_emb_vf))
-                                kl_emb += (val_divs / max_emb_div - dist_btw)**2
+                                kl_emb += th.abs(val_divs / max_emb_div - dist_btw_first)
                                 # kl_emb -= th.norm(p_emb_vf - q_emb_vf) / th.norm(ci - cj)
 
                     loss += kl_policy / count # TODO: didn't do this for the field experiments

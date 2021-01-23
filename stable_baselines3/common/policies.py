@@ -455,9 +455,9 @@ class ActorCriticPolicy(BasePolicy):
         # Note: If net_arch is None and some features extractor is used,
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = MlpExtractor(self.features_dim + self.context_size, net_arch=self.net_arch, activation_fn=self.activation_fn)
+        self.mlp_extractor = MlpExtractor(self.features_dim + self.context_size // 2, net_arch=self.net_arch, activation_fn=self.activation_fn)
 
-        latent_dim_pi = self.mlp_extractor.latent_dim_pi
+        latent_dim_pi = self.mlp_extractor.latent_dim_pi + self.context_size // 2
 
         # Separate feature extractor for gSDE
         if self.sde_net_arch is not None:
@@ -483,7 +483,14 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+        # self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf + self.context_size//2, 1)
+
+        self.value_net = nn.Sequential(
+            nn.Linear(self.mlp_extractor.latent_dim_vf + self.context_size//2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1))
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -511,7 +518,15 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to sample or use deterministic actions
         :return: (Tuple[th.Tensor, th.Tensor, th.Tensor]) action, value and log probability of the action
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
+        # print(ctx.shape)
+        # print(th.split(ctx, 4, dim=1))
+        ctx_first, ctx_second = th.split(ctx, self.context_size//2, dim=-1)
+
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx_first)
+
+        latent_pi = th.cat([latent_pi, ctx_second], axis=-1)
+        latent_vf = th.cat([latent_vf, ctx_second], axis=-1)
+
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
@@ -574,7 +589,12 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to use stochastic or deterministic actions
         :return: (th.Tensor) Taken action according to the policy
         """
-        latent_pi, _, latent_sde = self._get_latent(observation, context)
+        ctx_first, ctx_second = th.split(context, self.context_size//2, dim=-1)
+
+        latent_pi, _, latent_sde = self._get_latent(observation, ctx_first)
+
+        latent_pi = th.cat([latent_pi, ctx_second], axis=-1)
+
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         return distribution.get_actions(deterministic=deterministic)
 
@@ -588,7 +608,13 @@ class ActorCriticPolicy(BasePolicy):
         :return: (th.Tensor, th.Tensor, th.Tensor) estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
+        ctx_first, ctx_second = th.split(ctx, self.context_size//2, dim=-1)
+
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx_first)
+
+        latent_pi = th.cat([latent_pi, ctx_second], axis=-1)
+        latent_vf = th.cat([latent_vf, ctx_second], axis=-1)
+
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
