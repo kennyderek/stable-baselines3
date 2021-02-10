@@ -13,10 +13,11 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import safe_mean
 from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.preprocessing import get_obs_shape
 
 from abc import ABC, abstractmethod
 from stable_baselines3.common.decider import Decider, FCNDecider
-
+from gym.spaces import Box
 
 class BaseOnPolicyAlgorithm(BaseAlgorithm):
     """
@@ -123,6 +124,10 @@ class BaseOnPolicyAlgorithm(BaseAlgorithm):
             gamma=self.gamma,
             use_context=self.use_context
         )
+
+        self.current_decision = None
+        self.decision_dim = 16
+
         self.policy = self.policy_class(
             self.observation_space,
             self.action_space,
@@ -452,11 +457,30 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                     ctx_tensor = th.as_tensor(self.dict_obs_to_array(contexts, key_list), dtype=th.float32).to(self.device)
                 else:
                     ctx_tensor = None
-                actions, values, log_probs = self.policy.forward(obs_tensor, ctx_tensor)
+            
+                obs_tensor = th.as_tensor(self.dict_obs_to_array(self._last_obs, key_list)).to(self.device).float()
+                # do decision making processing
+                if self.current_decision == None:
+                    self.current_decision = th.zeros((1, self.decision_dim), dtype=th.float32)
+                self._last_decisions = self.array_to_dict_actions(self.current_decision.detach().numpy(), key_list)
+                
+                # yes_no, log_prob = self.policy.make_new_decision(obs_tensor, self.current_decision)
+                # if yes_no.item() == 1:
+                #     obs_tensor = self.policy.encode_new_decision(obs_tensor)
+                # else:
+                #     assert yes_no.item() == 0
+                #     obs_tensor = self.current_decision
+
+                # dictionary
+                # self._last_decisions = self.array_to_dict_actions(obs_tensor.detach().numpy(), key_list)
+
+            # with th.no_grad():
+                actions, values, log_probs, self.current_decision, dec_logits = self.policy.forward(obs_tensor, ctx_tensor, self.current_decision)
             actions = actions.cpu().numpy()
             dict_actions = self.array_to_dict_actions(actions, key_list)
             dict_values = self.array_to_dict_actions(values, key_list)
             dict_log_probs = self.array_to_dict_actions(log_probs, key_list)
+            dict_decisions = self.array_to_dict_actions(self.current_decision, key_list)
 
             # Rescale and perform action
             clipped_actions = actions
@@ -488,10 +512,14 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                                 action=dict_actions[agent_id],
                                 reward=rewards[agent_id],
                                 value=dict_values[agent_id],
-                                log_prob=dict_log_probs[agent_id])
+                                log_prob=dict_log_probs[agent_id],
+                                original_obs=0,
+                                last_decision=self._last_decisions[agent_id])
             
             if dones["__all__"]:
                 new_obs = env.reset()
+                # self.current_decision = th.zeros((1, self.decision_dim), dtype=th.float32)
+                self.current_decision = th.rand((1, self.decision_dim)) * 2 - 1
                 for agent_id, done in dones.items():
                     rollout_buffer.sig_kill(agent_id)
                 dones = {i : False for i in new_obs.keys()} # reset the dones for the new environment
@@ -505,6 +533,7 @@ class TrajectoryOnPolicyAlgorithm(BaseOnPolicyAlgorithm):
                         # del dict_values[agent_id]
             self._last_obs = new_obs
             self._last_dones = dones
+            self._last_decisions = self.current_decision
 
         rollout_buffer.compute_returns_and_advantage(dict_values)
 

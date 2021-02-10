@@ -23,7 +23,9 @@ from stable_baselines3.common.preprocessing import get_action_dim, is_image_spac
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, MlpExtractor, NatureCNN, create_mlp
 from stable_baselines3.common.utils import get_device, is_vectorized_observation
 from stable_baselines3.common.vec_env import VecTransposeImage
+from stable_baselines3.common.preprocessing import get_obs_shape
 
+from gym.spaces import Box
 
 class BaseModel(nn.Module, ABC):
     """
@@ -215,6 +217,7 @@ class BasePolicy(BaseModel):
         self,
         observation: np.ndarray,
         context: np.ndarray,
+        decision: np.ndarray,
         state: Optional[np.ndarray] = None,
         mask: Optional[np.ndarray] = None,
         deterministic: bool = False,
@@ -258,10 +261,12 @@ class BasePolicy(BaseModel):
             context = th.as_tensor(context, dtype=th.float32).to(self.device)
         else:
             context = None
+        decision = th.as_tensor(decision, dtype=th.float32).to(self.device)
         with th.no_grad():
-            actions = self._predict(observation, context, deterministic=deterministic)
+            actions, new_decision = self._predict(observation, context, decision, deterministic=deterministic)
         # Convert to numpy
         actions = actions.cpu().numpy()
+        new_decision = new_decision.cpu().numpy()
 
         if isinstance(self.action_space, gym.spaces.Box):
             if self.squash_output:
@@ -277,7 +282,7 @@ class BasePolicy(BaseModel):
         #         raise ValueError("Error: The environment must be vectorized when using recurrent policies.")
         #     actions = actions[0]
 
-        return actions, state
+        return actions, state, new_decision
 
     def scale_action(self, action: np.ndarray) -> np.ndarray:
         """
@@ -376,16 +381,38 @@ class ActorCriticPolicy(BasePolicy):
         # Default network architecture, from stable-baselines
         if net_arch is None:
             if features_extractor_class == FlattenExtractor:
-                net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
-                # net_arch = [dict(pi=[64, 64], vf=[64, 64])]
+                # net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
+                net_arch = [dict(pi=[64, 64], vf=[64, 64])]
             else:
-                net_arch = []
-                net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
+                net_arch = [dict(pi=[64, 64], vf=[64, 64])]
+                # net_arch = [dict(pi=[128, 128, 128], vf=[128, 128, 128])]
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
 
-        self.features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
+
+        obs_dim_len = get_obs_shape(self.observation_space)[0]
+        print("obs shape here:", obs_dim_len)
+        self.decision_dim = 16
+        self.decision_new = th.nn.Sequential(
+            th.nn.Linear(obs_dim_len + self.decision_dim, 128),
+            th.nn.Tanh(),
+            th.nn.Linear(128, 128),
+            th.nn.Tanh(),
+            th.nn.Linear(128, 2),
+            th.nn.Softmax()
+        )
+        self.decision_encoder = th.nn.Sequential(
+            th.nn.Linear(obs_dim_len, 128),
+            th.nn.Tanh(),
+            th.nn.Linear(128, 128),
+            th.nn.Tanh(),
+            th.nn.Linear(128, self.decision_dim)
+        )
+        self.decision_obs_space = Box(-1, 1, shape=(self.decision_dim,))
+
+
+        self.features_extractor = features_extractor_class(self.decision_obs_space, **self.features_extractor_kwargs)
         self.features_dim = self.features_extractor.features_dim
         self.context_size = context_size
 
@@ -503,7 +530,27 @@ class ActorCriticPolicy(BasePolicy):
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
-    def forward(self, obs: th.Tensor, ctx: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+
+    def make_new_decision(self, observation, last_decision, deterministic=False):
+        # print("obs dim", observation.shape)
+        # print("decision dim", last_decision.shape)
+        if deterministic:
+            obs_decision = th.cat([observation, last_decision], dim=-1).float()
+            new_logits = self.decision_new(obs_decision)
+            return th.abs(1 - th.argmax(new_logits, dim=-1)), 0
+        else:
+            obs_decision = th.cat([observation, last_decision], dim=-1).float()
+            new_logits = self.decision_new(obs_decision)
+            dist = th.distributions.bernoulli.Bernoulli(probs=new_logits[...,:1])
+            yes_or_no = dist.sample()
+            log_probs = dist.log_prob(yes_or_no)
+            # print("here we are:", yes_or_no, log_probs)
+            return yes_or_no, log_probs
+
+    def encode_new_decision(self, observation):
+        return self.decision_encoder(observation)
+
+    def forward(self, obs: th.Tensor, ctx: th.Tensor, dec: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -511,13 +558,23 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to sample or use deterministic actions
         :return: (Tuple[th.Tensor, th.Tensor, th.Tensor]) action, value and log probability of the action
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
+
+        yes_no, log_prob = self.make_new_decision(obs, dec)
+        # if yes_no.item() == 1:
+        #     dec_obs = self.encode_new_decision(obs)
+        # else:
+        #     assert yes_no.item() == 0
+        #     dec_obs = dec
+        dec_obs = (self.encode_new_decision(obs) * yes_no) + (dec * th.abs(1 - yes_no))
+
+
+        latent_pi, latent_vf, latent_sde = self._get_latent(dec_obs, ctx)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        return actions, values, log_prob
+        return actions, values, log_prob, dec_obs, yes_no
 
     def _get_latent(self, obs: th.Tensor, ctx: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -530,6 +587,7 @@ class ActorCriticPolicy(BasePolicy):
         """
         # Preprocess het observation if needed
         features = self.extract_features(obs)
+        # use 'obs' features to generate policy latents
         if self.context_size != 0:
             features = th.cat([features, ctx], 1)
         latent_pi, latent_vf = self.mlp_extractor(features)
@@ -566,7 +624,7 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise ValueError("Invalid action distribution")
 
-    def _predict(self, observation: th.Tensor, context: th.Tensor, deterministic: bool = False) -> th.Tensor:
+    def _predict(self, observation: th.Tensor, context: th.Tensor, decisions, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
 
@@ -574,11 +632,16 @@ class ActorCriticPolicy(BasePolicy):
         :param deterministic: (bool) Whether to use stochastic or deterministic actions
         :return: (th.Tensor) Taken action according to the policy
         """
-        latent_pi, _, latent_sde = self._get_latent(observation, context)
+        observation = observation.float()
+        yes_no, decison_log_prob = self.make_new_decision(observation, decisions, deterministic)
+        dec_obs = (self.encode_new_decision(observation) * yes_no) + (decisions * th.abs(1 - yes_no))
+        # print("wants:", self.encode_new_decision(observation))
+        # print("newest:", dec_obs)
+        latent_pi, _, latent_sde = self._get_latent(dec_obs, context)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
-        return distribution.get_actions(deterministic=deterministic)
+        return distribution.get_actions(deterministic=deterministic), dec_obs
 
-    def evaluate_actions(self, obs: th.Tensor, ctx: th.Tensor, actions: th.Tensor, return_all=False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def evaluate_actions(self, obs: th.Tensor, ctx: th.Tensor, actions: th.Tensor, dec: th.Tensor, return_all=False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -588,14 +651,18 @@ class ActorCriticPolicy(BasePolicy):
         :return: (th.Tensor, th.Tensor, th.Tensor) estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
-        latent_pi, latent_vf, latent_sde = self._get_latent(obs, ctx)
+
+        yes_no, decison_log_prob = self.make_new_decision(obs, dec)
+        dec_obs = (self.encode_new_decision(obs) * yes_no) + dec * th.abs(1 - yes_no)
+
+        latent_pi, latent_vf, latent_sde = self._get_latent(dec_obs, ctx)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
         if return_all:
             return values, log_prob, distribution.entropy(), latent_pi, latent_vf, latent_sde
         else:
-            return values, log_prob, distribution.entropy()
+            return values, log_prob, distribution.entropy(), yes_no, decison_log_prob
 
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):

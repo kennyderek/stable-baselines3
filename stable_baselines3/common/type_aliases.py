@@ -26,6 +26,8 @@ class RolloutBufferSamples(NamedTuple):
     advantages: th.Tensor
     returns: th.Tensor
     context_error: th.Tensor
+    original_observations: th.Tensor
+    last_decision: th.Tensor
 
 class ReplayBufferSamples(NamedTuple):
     observations: th.Tensor

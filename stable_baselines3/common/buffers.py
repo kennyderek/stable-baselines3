@@ -394,17 +394,27 @@ class TrajectoryBufferSamples():
         self.rewards = []
         self.values = []
         self.log_probs = []
+        self.original_observations = []
+        self.last_decision = []
         self.buffer_size = 0
         self.context_error = None
         self.use_context = use_context
 
-    def add(self, obs: np.ndarray, action: np.ndarray, reward: np.ndarray, value: th.Tensor, log_prob: th.Tensor
+    def add(self, obs: np.ndarray,
+                    action: np.ndarray,
+                    reward: np.ndarray,
+                    value: th.Tensor,
+                    log_prob: th.Tensor,
+                    original_obs: np.ndarray,
+                    last_decision: np.ndarray
         ) -> None:
         self.observations.append(obs) # this could be a tuple now
         self.actions.append(np.array(action).copy())
         self.rewards.append(np.array(reward).copy())
         self.values.append(value.clone().cpu().numpy().flatten())
         self.log_probs.append(log_prob.clone().cpu().numpy())
+        self.original_observations.append(original_obs)
+        self.last_decision.append(np.array(last_decision).copy())
         self.buffer_size += 1
 
     def _to_numpy(self):
@@ -414,8 +424,12 @@ class TrajectoryBufferSamples():
         # self.values = np.array(self.values)
         # self.log_probs = np.array(self.log_probs)
 
-        for l in ["observations", "actions", "values", "log_probs", "rewards"]:
-            self.__dict__[l] = np.array(self.__dict__[l])
+        for l in ["observations", "actions", "values", "log_probs", "rewards", "original_observations", "last_decision"]:
+            try:
+                self.__dict__[l] = np.array(self.__dict__[l])
+            except:
+                print("failed on ", l)
+                print(self.__dict__[l])
         
         self.returns = np.zeros((self.buffer_size, 1), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, 1), dtype=np.float32)
@@ -554,6 +568,8 @@ class TrajRolloutBuffer():
         values = np.concatenate([t.values for t in trajectories]).squeeze()
         log_probs = np.concatenate([t.log_probs for t in trajectories]).squeeze()
         advantages = np.concatenate([t.advantages for t in trajectories]).squeeze()
+        original_observations = np.concatenate([t.original_observations for t in trajectories]).squeeze()
+        last_decision = np.concatenate([t.last_decision for t in trajectories]).squeeze()
         if self.use_context:
             context_error = np.concatenate([t.context_error for t in trajectories]).squeeze()
             contexts = np.concatenate([np.broadcast_to(t.context, shape=(t.buffer_size,) + t.context.shape) for t in trajectories])
@@ -572,7 +588,9 @@ class TrajRolloutBuffer():
             log_probs[indices],
             advantages[indices],
             returns[indices],
-            context_error[indices]
+            context_error[indices],
+            original_observations[indices],
+            last_decision[indices]
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 

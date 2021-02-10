@@ -282,6 +282,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
         clip_fractions = []
         exploration_divs = []
         embedding_divs = []
+        all_new_decs = []
         sampler_density, sampler_loss = [], []
 
         # use_decider = False
@@ -316,7 +317,10 @@ class PPO(TrajectoryOnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, rollout_data.contexts, actions) # TODO, return features HERE
+                values, log_prob, entropy, new_decs, decision_log_prob = self.policy.evaluate_actions(rollout_data.observations, rollout_data.contexts, actions, rollout_data.last_decision) # TODO, return features HERE
+                all_new_decs.append(th.mean(new_decs).cpu().item())
+                decision_freq_loss = th.mean(decision_log_prob)
+
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -359,7 +363,7 @@ class PPO(TrajectoryOnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
+                loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss + decision_freq_loss
                 # if self.num_timesteps < self.pretrain_kl:
                 #     loss = 0
                 # loss = 0
@@ -508,11 +512,12 @@ class PPO(TrajectoryOnPolicyAlgorithm):
             logger.record("train/entropy_loss", np.mean(entropy_losses))
             logger.record("train/policy_gradient_loss", np.mean(pg_losses))
             logger.record("train/value_loss", np.mean(value_losses))
-            logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
-            logger.record("train/embedding_divergence", np.mean(np.array(embedding_divs)))
-            logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
-            logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
-            logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
+            # logger.record("train/div_divergence", np.mean(np.array(exploration_divs)))
+            # logger.record("train/embedding_divergence", np.mean(np.array(embedding_divs)))
+            # logger.record("train/sampler_entropy", np.mean(np.array(sampler_density)))
+            # logger.record("train/sampler_loss", np.mean(np.array(sampler_loss)))
+            # logger.record("train/decider_loss", np.mean(np.array(decider_losses)))
+            logger.record("train/new_decision_ratio", np.mean(np.array(all_new_decs)))
             # logger.record("train/vval_loss", np.mean(np.array(vvals)))
             # logger.record("train/approx_kl", np.mean(approx_kl_divs))
             # logger.record("train/clip_fraction", np.mean(clip_fraction))
